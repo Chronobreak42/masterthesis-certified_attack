@@ -441,7 +441,7 @@ TSWLatexianTemp*
 .vscode
 
 # Misc
-*.txt
+
 #debug files
 cache/*
 cache
