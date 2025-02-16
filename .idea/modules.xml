@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/robustness_of_gnns_at_scale-main.iml" filepath="$PROJECT_DIR$/.idea/robustness_of_gnns_at_scale-main.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/masterthesis-certified_attack.iml" filepath="$PROJECT_DIR$/.idea/masterthesis-certified_attack.iml" />
     </modules>
   </component>
 </project>
