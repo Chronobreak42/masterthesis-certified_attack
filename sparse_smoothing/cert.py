@@ -363,7 +363,7 @@ def p_lower_from_votes(votes, pre_votes, alpha, n_samples):
     # Multiple by 2 since we are only need a single side
     n_best = votes[np.arange(votes.shape[0]), pre_votes.argmax(1)]
     p_lower = proportion_confint(
-        n_best, n_samples, alpha=2 * alpha, method="beta")[0]
+        n_best, n_samples, alpha=2 * alpha, method="beta")[0] #Todo: proportion_confdint gibt den lower bound eines confidence intervalls zurück, hier nochmal näher reinschauen.
     return p_lower
 
 
