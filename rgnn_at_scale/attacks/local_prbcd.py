@@ -241,7 +241,7 @@ class LocalPRBCD(SparseLocalAttack):
 
     def sample_search_space(self, node_idx: int, n_perturbations: int):
         while True:
-            self.current_search_space = torch.randint(self.n - 1, (self.block_size,), device=self.device)
+            self.current_search_space = torch.randint(self.n - 1, (self.block_size,), device=self.device) #TODO: Hier soll initialisiert werden nach zertifikaten
             self.current_search_space[self.current_search_space >= node_idx] += 1
             self.current_search_space = torch.unique(self.current_search_space, sorted=True)
             self.modified_edge_weight_diff = torch.full_like(self.current_search_space, self.eps,
