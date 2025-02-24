@@ -75,7 +75,7 @@ class PRBCD(SparseAttack):
         self.attack_statistics = defaultdict(list)
 
         # Sample initial search space (Algorithm 1, line 3-4)
-        self.sample_random_block(n_perturbations)
+        self.sample_random_block(n_perturbations) #TODO: Hier kommen die grid_radii rein.
 
         # Accuracy and attack statistics before the attach even started
         with torch.no_grad():
@@ -143,7 +143,7 @@ class PRBCD(SparseAttack):
 
                 # Resampling of search space (Algorithm 1, line 9-14)
                 if epoch < self.epochs_resampling - 1:
-                    self.resample_random_block(n_perturbations)
+                    self.resample_random_block(n_perturbations) #TODO: Hier kommen die grid_radii rein.
                 elif self.with_early_stopping and epoch == self.epochs_resampling - 1:
                     # Retreive best epoch if early stopping is active (not explicitly covered by pesudo code)
                     logging.info(
@@ -309,6 +309,26 @@ class PRBCD(SparseAttack):
         return self.get_modified_adj()
 
     def sample_random_block(self, n_perturbations: int = 0):
+        for _ in range(self.max_final_samples):
+            self.current_search_space = torch.randint(
+                self.n_possible_edges, (self.block_size,), device=self.device)
+            self.current_search_space = torch.unique(self.current_search_space, sorted=True)
+            if self.make_undirected:
+                self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+            else:
+                self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
+                is_not_self_loop = self.modified_edge_index[0] != self.modified_edge_index[1]
+                self.current_search_space = self.current_search_space[is_not_self_loop]
+                self.modified_edge_index = self.modified_edge_index[:, is_not_self_loop]
+
+            self.perturbed_edge_weight = torch.full_like(
+                self.current_search_space, self.eps, dtype=torch.float32, requires_grad=True
+            )
+            if self.current_search_space.size(0) >= n_perturbations:
+                return
+        raise RuntimeError('Sampling random block was not successfull. Please decrease `n_perturbations`.')
+
+    def sample_block_from_certificates(self, grid_radii, n_perturbations: int = 0):
         for _ in range(self.max_final_samples):
             self.current_search_space = torch.randint(
                 self.n_possible_edges, (self.block_size,), device=self.device)
