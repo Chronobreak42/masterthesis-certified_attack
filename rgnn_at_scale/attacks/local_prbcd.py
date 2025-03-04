@@ -2,6 +2,8 @@ from collections import defaultdict
 
 import math
 import logging
+from typing import Optional
+
 from typeguard import typechecked
 
 import numpy as np
@@ -26,7 +28,7 @@ class LocalPRBCD(SparseLocalAttack):
                  display_step: int = 20,
                  epochs: int = 150,
                  fine_tune_epochs: int = 50,
-                 block_size: int = 10_000,
+                 block_size: int = 10_000, #Todo: Blocksize anpassen wegen
                  with_early_stopping: bool = True,
                  do_synchronize: bool = False,
                  eps: float = 1e-14,
@@ -60,9 +62,12 @@ class LocalPRBCD(SparseLocalAttack):
         self.lr_factor = lr_factor
         self.lr_factor *= max(math.sqrt(self.n / self.block_size), 1.)
 
-    def _attack(self, n_perturbations: int, node_idx: int, **kwargs):
+    def _attack(self, n_perturbations: int, node_idx: int,  grid_radii: Optional[np.ndarray] = None, use_cert: bool = False, **kwargs):
 
-        self.sample_search_space(node_idx, n_perturbations)
+        if use_cert:
+            self.sample_search_space_from_cert(node_idx, n_perturbations, grid_radii=grid_radii)
+        else:
+            self.sample_search_space(node_idx, n_perturbations)
         best_margin = float('Inf')
         best_epoch = float('-Inf')
         self.attack_statistics = defaultdict(list)
@@ -242,6 +247,17 @@ class LocalPRBCD(SparseLocalAttack):
     def sample_search_space(self, node_idx: int, n_perturbations: int):
         while True:
             self.current_search_space = torch.randint(self.n - 1, (self.block_size,), device=self.device) #TODO: Hier soll initialisiert werden nach zertifikaten
+            self.current_search_space[self.current_search_space >= node_idx] += 1
+            self.current_search_space = torch.unique(self.current_search_space, sorted=True)
+            self.modified_edge_weight_diff = torch.full_like(self.current_search_space, self.eps,
+                                                             dtype=torch.float32, requires_grad=True)
+            if self.current_search_space.size(0) >= n_perturbations:
+                break
+
+    def sample_search_space_from_cert(self, node_idx: int, n_perturbations: int, grid_radii: Optional[np.ndarray] = None):
+        while True:
+            self.current_search_space = np.where(grid_radii[:,0,1] == False)[0]
+            self.current_search_space = torch.from_numpy(np.random.choice(self.current_search_space, self.block_size, replace=False))
             self.current_search_space[self.current_search_space >= node_idx] += 1
             self.current_search_space = torch.unique(self.current_search_space, sorted=True)
             self.modified_edge_weight_diff = torch.full_like(self.current_search_space, self.eps,

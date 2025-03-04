@@ -12,6 +12,7 @@ import torch
 from torch.nn import functional as F
 
 from torch_sparse import SparseTensor
+
 from rgnn_at_scale.models import MODEL_TYPE, DenseGCN, GCN, RGNN, BATCHED_PPR_MODELS
 from rgnn_at_scale.helper.utils import accuracy
 
@@ -111,7 +112,7 @@ class Attack(ABC):
     def _attack(self, n_perturbations: int, **kwargs):
         pass
 
-    def attack(self, n_perturbations: int, **kwargs):
+    def attack(self, n_perturbations: int, grid_radii: Optional[np.ndarray] = None, use_cert: bool = False, **kwargs):
         """
         Executes the attack on the model updating the attributes
         self.adj_adversary and self.attr_adversary accordingly.
@@ -122,7 +123,7 @@ class Attack(ABC):
             number of perturbations (attack budget in terms of node additions/deletions) that constrain the atack
         """
         if n_perturbations > 0:
-            return self._attack(n_perturbations, **kwargs)
+            return self._attack(n_perturbations, **kwargs, grid_radii=grid_radii)
         else:
             self.attr_adversary = self.attr
             self.adj_adversary = self.adj

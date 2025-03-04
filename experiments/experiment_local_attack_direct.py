@@ -1,6 +1,6 @@
 import collections
 import logging
-from typing import Any, Dict, Sequence, Union
+from typing import Any, Dict, Sequence, Union, Optional
 
 import numpy as np
 from sacred import Experiment
@@ -39,7 +39,7 @@ def config():
         },
         "epochs": 400,
         "fine_tune_epochs": 100,
-        "block_size": 10_000,
+        "block_size": 10000,
         "ppr_recalc_at_end": True,
         "loss_type": "Margin",
         "lr_factor": 0.05
@@ -67,7 +67,7 @@ def config():
 @ex.automain
 def run(data_dir: str, dataset: str, attack: str, attack_params: Dict[str, Any], nodes: str, nodes_topk: int, seed: int,
         epsilons: Sequence[float], min_node_degree: int, binary_attr: bool, make_undirected: bool, artifact_dir: str, model_label: str,
-        model_storage_type: str, device: Union[str, int], data_device: Union[str, int], debug_level: str):
+        model_storage_type: str, device: Union[str, int], data_device: Union[str, int], debug_level: str, grid_radii: Optional[np.ndarray] = None, use_cert: bool = False):
     """
     Instantiates a sacred experiment executing a direct local attack run for a given model configuration.
     Local evasion attacks aim to flip the label of a single node only.
@@ -183,7 +183,7 @@ def run(data_dir: str, dataset: str, attack: str, attack_params: Dict[str, Any],
 
                 # In case the model is non-deterministic to get the results either after attacking or after loading
                 try:
-                    adversary.attack(n_perturbations, node_idx=node)
+                    adversary.attack(n_perturbations, node_idx=node, grid_radii=grid_radii)
                 except Exception as e:
                     logging.exception(e)
                     logging.error(
