@@ -181,6 +181,48 @@ class Storage():
             )
             raise
 
+    def delete_artifact(self, artifact_type: str, params: Dict[str, Any], artifact: Dict[str, Any]) -> str:
+        """Deletes an artifact.
+
+        Parameters
+        ----------
+        artifact_type : str
+            Identifier of artifact type.
+        params : Dict[str, Any]
+            parameters identifying the artifacts provenance.
+        artifact : Dict[str, Any]
+            The actual artifact to be stored.
+
+        Returns
+        -------
+        str
+            File storage location.
+
+        Raises
+        ------
+        RuntimeError
+            In case more than one artifact with identical configuration is found.
+        """
+        ids = Storage.locked_call(
+            lambda: self._upsert_meta(artifact_type, params),
+            self._get_lock_path(artifact_type),
+            self.lock_timeout,
+        )
+        if len(ids) != 1:
+            raise RuntimeError(f'The index contains duplicates (artifact_type={artifact_type}, params={params})')
+
+        try:
+            path = self._build_artifact_path(artifact_type, ids[0])
+            torch.save(artifact, path)
+            return path
+        except:  # noqa: E722
+            Storage.locked_call(
+                lambda: self._remove_meta(artifact_type, params),
+                self._get_lock_path(artifact_type),
+                self.lock_timeout
+            )
+            raise
+
     def load_artifact(self, artifact_type: str, params: Dict[str, Any],
                       return_params: bool = False) -> Union[Dict[str, Any], Tuple[Dict[str, Any], Dict[str, Any]]]:
         """Loads an artifact.

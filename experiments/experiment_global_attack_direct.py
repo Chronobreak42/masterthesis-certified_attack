@@ -1,7 +1,8 @@
 
 import logging
-from typing import Any, Dict, Sequence, Union
+from typing import Any, Dict, Sequence, Union, Optional
 
+import numpy as np
 from sacred import Experiment
 
 import torch
@@ -63,7 +64,7 @@ def config():
 def run(data_dir: str, dataset: str, attack: str, attack_params: Dict[str, Any], epsilons: Sequence[float],
         binary_attr: bool, make_undirected: bool, seed: int, artifact_dir: str, pert_adj_storage_type: str,
         pert_attr_storage_type: str, model_label: str, model_storage_type: str, device: Union[str, int],
-        data_device: Union[str, int], debug_level: str):
+        data_device: Union[str, int], debug_level: str, grid_radii: Optional[np.ndarray] = None, use_cert: bool = False):
     """
     Instantiates a sacred experiment executing a global direct attack run for a given model configuration.
     Caches the perturbed adjacency to storage and evaluates the models perturbed accuracy. 
@@ -142,7 +143,7 @@ def run(data_dir: str, dataset: str, attack: str, attack_params: Dict[str, Any],
 
         for epsilon in epsilons:
             run_global_attack(epsilon, m, storage, pert_adj_storage_type, pert_attr_storage_type,
-                              pert_params, adversary, model_label)
+                              pert_params, adversary, model_label, grid_radii)
 
             adj_adversary = adversary.adj_adversary
             attr_adversary = adversary.attr_adversary

@@ -2,7 +2,7 @@ import logging
 
 from collections import defaultdict
 import math
-from typing import Tuple
+from typing import Tuple, Optional
 
 from tqdm import tqdm
 import numpy as np
@@ -55,7 +55,7 @@ class PRBCD(SparseAttack):
 
         self.lr_factor = lr_factor * max(math.log2(self.n_possible_edges / self.block_size), 1.)
 
-    def _attack(self, n_perturbations, **kwargs):
+    def _attack(self, n_perturbations, grid_radii: Optional[np.ndarray] = None, **kwargs):
         """Perform attack (`n_perturbations` is increasing as it was a greedy attack).
 
         Parameters
@@ -75,7 +75,10 @@ class PRBCD(SparseAttack):
         self.attack_statistics = defaultdict(list)
 
         # Sample initial search space (Algorithm 1, line 3-4)
-        self.sample_random_block(n_perturbations) #TODO: Hier kommen die grid_radii rein.
+        if grid_radii is not None:
+            self.sample_block_from_certificates(grid_radii=grid_radii, n_perturbations=n_perturbations)  # TODO: Hier kommen die grid_radii rein.
+        else:
+            self.sample_random_block(n_perturbations)
 
         # Accuracy and attack statistics before the attach even started
         with torch.no_grad():
@@ -330,8 +333,9 @@ class PRBCD(SparseAttack):
 
     def sample_block_from_certificates(self, grid_radii, n_perturbations: int = 0):
         for _ in range(self.max_final_samples):
-            self.current_search_space = torch.randint(
-                self.n_possible_edges, (self.block_size,), device=self.device)
+            self.current_search_space = np.where(grid_radii[:, 2, 2] == False)[0]
+            self.current_search_space = torch.from_numpy(
+                np.random.choice(self.current_search_space, self.block_size, replace=False))
             self.current_search_space = torch.unique(self.current_search_space, sorted=True)
             if self.make_undirected:
                 self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
@@ -348,7 +352,7 @@ class PRBCD(SparseAttack):
                 return
         raise RuntimeError('Sampling random block was not successfull. Please decrease `n_perturbations`.')
 
-    def resample_random_block(self, n_perturbations: int):
+    def resample_random_block(self, n_perturbations: int): #TODO: still work to be done
         if self.keep_heuristic == 'WeightOnly':
             sorted_idx = torch.argsort(self.perturbed_edge_weight)
             idx_keep = (self.perturbed_edge_weight <= self.eps).sum().long()
