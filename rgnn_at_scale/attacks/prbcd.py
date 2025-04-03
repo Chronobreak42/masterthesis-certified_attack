@@ -146,7 +146,11 @@ class PRBCD(SparseAttack):
 
                 # Resampling of search space (Algorithm 1, line 9-14)
                 if epoch < self.epochs_resampling - 1:
-                    self.resample_random_block(n_perturbations) #TODO: Hier kommen die grid_radii rein.
+                    if grid_radii is not None:
+                        self.resample_random_block(grid_radii=grid_radii,
+                                                            n_perturbations=n_perturbations)  # TODO: Hier kommen die grid_radii rein.
+                    else:
+                        self.resample_random_block(n_perturbations) #TODO: Hier kommen die grid_radii rein.
                 elif self.with_early_stopping and epoch == self.epochs_resampling - 1:
                     # Retreive best epoch if early stopping is active (not explicitly covered by pesudo code)
                     logging.info(
@@ -371,6 +375,54 @@ class PRBCD(SparseAttack):
         for i in range(self.max_final_samples):
             n_edges_resample = self.block_size - self.current_search_space.size(0)
             lin_index = torch.randint(self.n_possible_edges, (n_edges_resample,), device=self.device)
+
+            self.current_search_space, unique_idx = torch.unique(
+                torch.cat((self.current_search_space, lin_index)),
+                sorted=True,
+                return_inverse=True
+            )
+
+            if self.make_undirected:
+                self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+            else:
+                self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
+
+            # Merge existing weights with new edge weights
+            perturbed_edge_weight_old = self.perturbed_edge_weight.clone()
+            self.perturbed_edge_weight = torch.full_like(self.current_search_space, self.eps, dtype=torch.float32)
+            self.perturbed_edge_weight[
+                unique_idx[:perturbed_edge_weight_old.size(0)]
+            ] = perturbed_edge_weight_old
+
+            if not self.make_undirected:
+                is_not_self_loop = self.modified_edge_index[0] != self.modified_edge_index[1]
+                self.current_search_space = self.current_search_space[is_not_self_loop]
+                self.modified_edge_index = self.modified_edge_index[:, is_not_self_loop]
+                self.perturbed_edge_weight = self.perturbed_edge_weight[is_not_self_loop]
+
+            if self.current_search_space.size(0) > n_perturbations:
+                return
+        raise RuntimeError('Sampling random block was not successfull. Please decrease `n_perturbations`.')
+
+    def resample_random_block_from_cert(self, grid_radii, n_perturbations: int = 0): #TODO: still work to be done
+        if self.keep_heuristic == 'WeightOnly':
+            sorted_idx = 1
+            idx_keep = (self.perturbed_edge_weight <= self.eps).sum().long()
+            # Keep at most half of the block (i.e. resample low weights)
+            if idx_keep < sorted_idx.size(0) // 2:
+                idx_keep = sorted_idx.size(0) // 2
+        else:
+            raise NotImplementedError('Only keep_heuristic=`WeightOnly` supported')
+
+        sorted_idx = sorted_idx[idx_keep:]
+        self.current_search_space = self.current_search_space[sorted_idx]
+        self.modified_edge_index = self.modified_edge_index[:, sorted_idx]
+        self.perturbed_edge_weight = self.perturbed_edge_weight[sorted_idx]
+
+        # Sample until enough edges were drawn
+        for i in range(self.max_final_samples):
+            n_edges_resample = self.block_size - self.current_search_space.size(0)
+            lin_index = torch.randint(self.n_possible_edges, (n_edges_resample,), device=self.device) #TODO wahrscheinlich hier neues sampling mit cert
 
             self.current_search_space, unique_idx = torch.unique(
                 torch.cat((self.current_search_space, lin_index)),
