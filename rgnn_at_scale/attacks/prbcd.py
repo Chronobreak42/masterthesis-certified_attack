@@ -106,7 +106,7 @@ class PRBCD(SparseAttack):
             # Calculate logits for each node (Algorithm 1, line 6)
             logits = self._get_logits(self.attr, edge_index, edge_weight)
             # Calculate loss combining all each node (Algorithm 1, line 7)
-            loss = self.calculate_loss(logits[self.idx_attack], self.labels[self.idx_attack])
+            loss = self.calculate_loss(logits[self.idx_attack], self.labels[self.idx_attack]) #Todo: Hier wird der loss und gradient für perturbed edge weight erzeugt.
             # Retreive gradient towards the current block (Algorithm 1, line 7)
             gradient = utils.grad_with_checkpoint(loss, self.perturbed_edge_weight)[0]
 
