@@ -45,6 +45,7 @@ class PRBCD(SparseAttack):
         self.max_final_samples = max_final_samples
 
         self.current_search_space: torch.Tensor = None
+        self.sample_space: torch.Tensor = None
         self.modified_edge_index: torch.Tensor = None
         self.perturbed_edge_weight: torch.Tensor = None
 
@@ -55,7 +56,7 @@ class PRBCD(SparseAttack):
 
         self.lr_factor = lr_factor * max(math.log2(self.n_possible_edges / self.block_size), 1.)
 
-    def _attack(self, n_perturbations, grid_radii: Optional[np.ndarray] = None, **kwargs):
+    def _attack(self, n_perturbations, use_cert="none", grid_radii: Optional[np.ndarray] = None, **kwargs):
         """Perform attack (`n_perturbations` is increasing as it was a greedy attack).
 
         Parameters
@@ -75,7 +76,7 @@ class PRBCD(SparseAttack):
         self.attack_statistics = defaultdict(list)
 
         # Sample initial search space (Algorithm 1, line 3-4)
-        if grid_radii is not None:
+        if use_cert in ("sampling", "both"):
             self.sample_block_from_certificates(grid_radii=grid_radii, n_perturbations=n_perturbations)  # TODO: Hier kommen die grid_radii rein.
         else:
             self.sample_random_block(n_perturbations)
@@ -146,8 +147,8 @@ class PRBCD(SparseAttack):
 
                 # Resampling of search space (Algorithm 1, line 9-14)
                 if epoch < self.epochs_resampling - 1:
-                    if grid_radii is not None:
-                        self.resample_random_block(grid_radii=grid_radii,
+                    if use_cert in ("resampling", "both"):
+                        self.resample_random_block_from_cert(grid_radii=grid_radii,
                                                             n_perturbations=n_perturbations)  # TODO: Hier kommen die grid_radii rein.
                     else:
                         self.resample_random_block(n_perturbations) #TODO: Hier kommen die grid_radii rein.
@@ -406,7 +407,7 @@ class PRBCD(SparseAttack):
 
     def resample_random_block_from_cert(self, grid_radii, n_perturbations: int = 0): #TODO: still work to be done
         if self.keep_heuristic == 'WeightOnly':
-            sorted_idx = 1
+            sorted_idx = torch.argsort(self.perturbed_edge_weight)
             idx_keep = (self.perturbed_edge_weight <= self.eps).sum().long()
             # Keep at most half of the block (i.e. resample low weights)
             if idx_keep < sorted_idx.size(0) // 2:
@@ -419,10 +420,27 @@ class PRBCD(SparseAttack):
         self.modified_edge_index = self.modified_edge_index[:, sorted_idx]
         self.perturbed_edge_weight = self.perturbed_edge_weight[sorted_idx]
 
+        # Adding sample_space, this could be useful to avoid passing grid_radii in every function call.
+        # I am adding it here as a trial. If added for final version, sample_space initialization can be removed here and moved to a better line (e.g. sample_block_from_cert())
+        # this depends on usage/strategy and if sample_space should change -koko
+        # now looking at it again, as there are different certificate usages, whether used both in sampling and resampling or both or none,
+        # sample_space has to be initialized in both functions -koko2
+        grid_radii = torch.from_numpy(grid_radii).bool() # transformed to tensor for torch.where
+        self.sample_space = torch.where(grid_radii[:, 2, 2] == False)[0]
+        # The following line removes all entries from sample_space, which are already in current_search_space as we only want to draw new values,
+        # it could be discussed if we want to do this step earlier before current_search_space is cut by sorted_idx, so that only values that have not been drawn yet are in sample_space
+        self.sample_space = self.sample_space[~torch.isin(self.sample_space, self.current_search_space)]
+
         # Sample until enough edges were drawn
         for i in range(self.max_final_samples):
             n_edges_resample = self.block_size - self.current_search_space.size(0)
-            lin_index = torch.randint(self.n_possible_edges, (n_edges_resample,), device=self.device) #TODO wahrscheinlich hier neues sampling mit cert
+
+            #lin_index = torch.randint(self.n_possible_edges, (n_edges_resample,), device=self.device) #TODO wahrscheinlich hier neues sampling mit cert
+            # Change following code to replace line above
+            # This samples from sample_space by shuffling the indices of sample_space and drawing the first n_edges_resample entries
+            lin_index = self.sample_space[torch.randperm(len(self.sample_space))[:n_edges_resample]]
+            lin_index = torch.unique(lin_index, sorted=True)
+
 
             self.current_search_space, unique_idx = torch.unique(
                 torch.cat((self.current_search_space, lin_index)),
