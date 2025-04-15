@@ -56,7 +56,7 @@ class PRBCD(SparseAttack):
 
         self.lr_factor = lr_factor * max(math.log2(self.n_possible_edges / self.block_size), 1.)
 
-    def _attack(self, n_perturbations, use_cert="none", grid_radii: Optional[np.ndarray] = None, **kwargs):
+    def _attack(self, n_perturbations, use_cert="none", grid_radii: Optional[np.ndarray] = None, grid_binary_class: Optional[np.ndarray] = None, **kwargs):
         """Perform attack (`n_perturbations` is increasing as it was a greedy attack).
 
         Parameters
@@ -64,6 +64,8 @@ class PRBCD(SparseAttack):
         n_perturbations : int
             Number of edges to be perturbed (assuming an undirected graph)
         """
+        n_perturbations = 1
+
         assert self.block_size > n_perturbations, \
             f'The search space size ({self.block_size}) must be ' \
             + f'greater than the number of permutations ({n_perturbations})'
@@ -76,8 +78,10 @@ class PRBCD(SparseAttack):
         self.attack_statistics = defaultdict(list)
 
         # Sample initial search space (Algorithm 1, line 3-4)
-        if use_cert in ("sampling", "both"):
-            self.sample_block_from_certificates(grid_radii=grid_radii, n_perturbations=n_perturbations)  # TODO: Hier kommen die grid_radii rein.
+        if use_cert in ("sampling_grid_radii", "both"):
+            self.sample_block_from_certificates_radii(grid_radii=grid_radii, n_perturbations=n_perturbations)  # TODO: Hier kommen die grid_radii rein.
+        elif use_cert in ("sampling_grid_binary_class"):
+            self.sample_block_from_certificates_binary_class(grid_binary_class=grid_binary_class, n_perturbations=n_perturbations)
         else:
             self.sample_random_block(n_perturbations)
 
@@ -148,8 +152,8 @@ class PRBCD(SparseAttack):
                 # Resampling of search space (Algorithm 1, line 9-14)
                 if epoch < self.epochs_resampling - 1:
                     if use_cert in ("resampling", "both"):
-                        self.resample_random_block_from_cert(grid_radii=grid_radii,
-                                                            n_perturbations=n_perturbations)  # TODO: Hier kommen die grid_radii rein.
+                        self.resample_random_block_from_cert_radii(grid_radii=grid_radii,
+                                                                   n_perturbations=n_perturbations)  # TODO: Hier kommen die grid_radii rein.
                     else:
                         self.resample_random_block(n_perturbations) #TODO: Hier kommen die grid_radii rein.
                 elif self.with_early_stopping and epoch == self.epochs_resampling - 1:
@@ -336,13 +340,33 @@ class PRBCD(SparseAttack):
                 return
         raise RuntimeError('Sampling random block was not successfull. Please decrease `n_perturbations`.')
 
-    def sample_block_from_certificates(self, grid_radii, n_perturbations: int = 0):
+    def sample_block_from_certificates_radii(self, grid_radii, n_perturbations: int = 0):
         for _ in range(self.max_final_samples):
             self.current_search_space = np.where(grid_radii[:, 2, 2] == False)[0]
             self.block_size = int(self.current_search_space.size * 0.75) #variable blocksize TODO: change factor later or something
             self.current_search_space = torch.from_numpy(
                 np.random.choice(self.current_search_space, self.block_size, replace=False))
             self.current_search_space = torch.unique(self.current_search_space, sorted=True)
+            if self.make_undirected:
+                self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+            else:
+                self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
+                is_not_self_loop = self.modified_edge_index[0] != self.modified_edge_index[1]
+                self.current_search_space = self.current_search_space[is_not_self_loop]
+                self.modified_edge_index = self.modified_edge_index[:, is_not_self_loop]
+
+            self.perturbed_edge_weight = torch.full_like(
+                self.current_search_space, self.eps, dtype=torch.float32, requires_grad=True
+            )
+            if self.current_search_space.size(0) >= n_perturbations:
+                return
+        raise RuntimeError('Sampling random block was not successfull. Please decrease `n_perturbations`.')
+
+    def sample_block_from_certificates_binary_class(self, grid_binary_class, n_perturbations: int = 0):
+        for _ in range(self.max_final_samples):
+            sums = np.sum(grid_binary_class, axis=(1, 2))  # shape: (2810,)
+            smallest_indices = np.argsort(sums)[:self.block_size]
+            self.current_search_space = torch.from_numpy(smallest_indices)
             if self.make_undirected:
                 self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
             else:
@@ -406,7 +430,7 @@ class PRBCD(SparseAttack):
                 return
         raise RuntimeError('Sampling random block was not successfull. Please decrease `n_perturbations`.')
 
-    def resample_random_block_from_cert(self, grid_radii, n_perturbations: int = 0): #TODO: still work to be done
+    def resample_random_block_from_cert_radii(self, grid_radii, n_perturbations: int = 0): #TODO: still work to be done
         if self.keep_heuristic == 'WeightOnly':
             sorted_idx = torch.argsort(self.perturbed_edge_weight)
             idx_keep = (self.perturbed_edge_weight <= self.eps).sum().long()
