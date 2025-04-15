@@ -339,6 +339,7 @@ class PRBCD(SparseAttack):
     def sample_block_from_certificates(self, grid_radii, n_perturbations: int = 0):
         for _ in range(self.max_final_samples):
             self.current_search_space = np.where(grid_radii[:, 2, 2] == False)[0]
+            self.block_size = int(self.current_search_space.size * 0.75) #variable blocksize TODO: change factor later or something
             self.current_search_space = torch.from_numpy(
                 np.random.choice(self.current_search_space, self.block_size, replace=False))
             self.current_search_space = torch.unique(self.current_search_space, sorted=True)
