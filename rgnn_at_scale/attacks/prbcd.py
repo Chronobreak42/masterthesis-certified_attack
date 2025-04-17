@@ -45,7 +45,9 @@ class PRBCD(SparseAttack):
         self.max_final_samples = max_final_samples
 
         self.current_search_space: torch.Tensor = None
+        self.current_node_search_space: torch.Tensor = None
         self.sample_space: torch.Tensor = None
+        self.edges_to_attack_index: torch.Tensor = torch.empty((2, 0), dtype=torch.long)
         self.modified_edge_index: torch.Tensor = None
         self.perturbed_edge_weight: torch.Tensor = None
 
@@ -64,8 +66,6 @@ class PRBCD(SparseAttack):
         n_perturbations : int
             Number of edges to be perturbed (assuming an undirected graph)
         """
-        n_perturbations = 1
-
         assert self.block_size > n_perturbations, \
             f'The search space size ({self.block_size}) must be ' \
             + f'greater than the number of permutations ({n_perturbations})'
@@ -342,19 +342,32 @@ class PRBCD(SparseAttack):
 
     def sample_block_from_certificates_radii(self, grid_radii, n_perturbations: int = 0):
         for _ in range(self.max_final_samples):
-            self.current_search_space = np.where(grid_radii[:, 2, 2] == False)[0]
-            self.block_size = int(self.current_search_space.size * 0.75) #variable blocksize TODO: change factor later or something
-            self.current_search_space = torch.from_numpy(
-                np.random.choice(self.current_search_space, self.block_size, replace=False))
-            self.current_search_space = torch.unique(self.current_search_space, sorted=True)
-            if self.make_undirected:
-                self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
-            else:
-                self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
-                is_not_self_loop = self.modified_edge_index[0] != self.modified_edge_index[1]
-                self.current_search_space = self.current_search_space[is_not_self_loop]
-                self.modified_edge_index = self.modified_edge_index[:, is_not_self_loop]
+            self.current_node_search_space = np.where(grid_radii[:, 2, 2] == False)[0]
 
+
+            #self.current_edge_idx_search_space = torch.from_numpy(
+            #    np.random.choice(self.current_edge_idx_search_space, self.block_size, replace=False))
+            #self.current_edge_idx_search_space = torch.unique(self.current_edge_idx_search_space, sorted=True)
+
+            # draw edges: draw nodes from current_node_search_space and concatenate
+            # First attempt
+            edges_idx = self.build_full_idx_matrix()
+            # bis hierhin wird für die gesamte Blockmatrix gezogen
+
+            # Second attempt with draw_undirected_matrix
+            #edges_idx = PRBCD.draw_undirected_matrix(nodes_1, self.current_node_search_space)
+
+            if self.make_undirected:
+                #self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_edge_idx_search_space)
+                # make undirected: cut all (x,y) where x >= y
+                self.setup_search_space_undirected(self.n)
+                # TODO: This will cut arbitrary number of entries, I made a function draw_undirected_matrix() to bypass this, but may be slow
+                # maybe return later to this idea
+            else:
+                # TODO: i have not checked if it works for the directed case
+                self.modified_edge_index = PRBCD.cut_diagonal_entries(edges_idx)
+
+            #self.current_search_space = PRBCD.full_to_linear_idx(self.n, self.modified_edge_index)
             self.perturbed_edge_weight = torch.full_like(
                 self.current_search_space, self.eps, dtype=torch.float32, requires_grad=True
             )
@@ -516,6 +529,66 @@ class PRBCD(SparseAttack):
         col_idx = lin_idx % n
         return torch.stack((row_idx, col_idx))
 
+    @staticmethod
+    def full_to_linear_idx(n: int, full_idx: torch.Tensor) -> torch.Tensor:
+        # this function made errors in the undirected case, maybe this will be useful for the directed case
+        row_idx, col_idx = full_idx[0], full_idx[1]
+        lin_idx = row_idx * n + col_idx
+        return lin_idx
+
+    @staticmethod
+    def triu_idx_to_linear_idx(n: int, full_idx: torch.Tensor) -> torch.Tensor:
+        # if im correct in the undirected case, the indexing of the block matrix is different to the directed case (see my note: (1) )
+        row_idx, col_idx = full_idx[0], full_idx[1]
+        lin_idx = (n * row_idx - row_idx * (row_idx + 1) // 2) + (col_idx - row_idx - 1)
+        return lin_idx
+
+    def build_full_idx_matrix(self):
+        nodes_1 = torch.from_numpy(np.random.choice(self.current_node_search_space, size=self.block_size, replace=True))
+        nodes_2 = torch.from_numpy(np.random.choice(self.current_node_search_space, size=self.block_size, replace=True))
+        edges_idx = torch.cat([nodes_1.unsqueeze(0), nodes_2.unsqueeze(0)], dim=0)
+        self.edges_to_attack_index = torch.cat([self.edges_to_attack_index, edges_idx], dim=1)
+        return edges_idx
+
+    def setup_search_space_undirected(self, n: int):
+        # matrix: random drawn block matrix this matrix is drawn from two node sets which are
+        # not robust according to certificates
+        # from here we want to follow same steps as sample_random_block
+        self.edges_to_current_search_space(n)
+
+        # first we cut edges so that index build a triu matrix
+        # (function triu_idx_to_linear only support triu matrix idx)
+        # self.edges_to_attack_index = PRBCD.cut_matrix_idx_to_triu_idx(self.edges_to_attack_index)
+        # we then build linear idx which is the current_search_space
+        # self.current_search_space = PRBCD.triu_idx_to_linear_idx(n, self.edges_to_attack_index)
+        # self.current_search_space = torch.unique(self.current_search_space, sorted=True)
+        # The three code lines in this comment block are necessairy steps to keep this experimental approach conform with the rest of code
+        # These could be outsourced as they are repeated in the while loop, may be repeated for resample aswell
+        # there may be better approaches, at this time this works, so we keep this until it stops running
+        # UPDATE: edges_to_current_search_space() is the outsourced method, lets see if this works
+
+        while self.current_search_space.size(0) < self.block_size:
+            # here we want to fill up current_search_space so that there are block_size many entries
+            self.build_full_idx_matrix()
+            self.edges_to_current_search_space(n)
+            #self.edges_to_attack_index = PRBCD.cut_matrix_idx_to_triu_idx(self.edges_to_attack_index)
+            #self.current_search_space = PRBCD.triu_idx_to_linear_idx(n, self.edges_to_attack_index)
+            #self.current_search_space = torch.unique(self.current_search_space, sorted=True)
+
+
+        # now we follow same steps as sample_random_block
+        #self.current_search_space = torch.unique(self.current_search_space, sorted=True)
+        self.current_search_space = self.current_search_space[
+                                        torch.randperm(self.current_search_space.size(0))[:self.block_size]
+                                        ]
+        self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+        return
+
+    def edges_to_current_search_space(self, n: int):
+        self.edges_to_attack_index = PRBCD.cut_matrix_idx_to_triu_idx(self.edges_to_attack_index)
+        self.current_search_space = PRBCD.triu_idx_to_linear_idx(n, self.edges_to_attack_index)
+        self.current_search_space = torch.unique(self.current_search_space, sorted=True)
+        return
     def _append_attack_statistics(self, loss: float, accuracy: float,
                                   probability_mass_update: float, probability_mass_projected: float):
         self.attack_statistics['loss'].append(loss)
@@ -523,3 +596,40 @@ class PRBCD(SparseAttack):
         self.attack_statistics['nonzero_weights'].append((self.perturbed_edge_weight > self.eps).sum().item())
         self.attack_statistics['probability_mass_update'].append(probability_mass_update)
         self.attack_statistics['probability_mass_projected'].append(probability_mass_projected)
+
+    @staticmethod
+    def cut_matrix_idx_to_triu_idx(matrix: torch.tensor) -> torch.Tensor:
+        # cut all entries of matrix where the entry (x,y) holds x >= y
+        row_idx = matrix[0]
+        col_idx = matrix[1]
+        mask = row_idx < col_idx
+        #returns undirected triu matrix
+        return matrix[:, mask]
+
+    @staticmethod
+    def cut_diagonal_entries(matrix: torch.tensor) -> torch.Tensor:
+        row_idx = matrix[0]
+        col_idx = matrix[1]
+        mask = row_idx != col_idx
+        # returns directed matrix (diagonal is cut)
+        return matrix[:, mask]
+
+    @staticmethod
+    def draw_undirected_matrix(row_idx: torch.tensor, sample_node_space) -> torch.tensor:
+        # this method takes a row_idx tensor and draws a col_idx from sample_node_space
+        # because we want to draw an undirected matrix every entry (x,y) needs to hold x < y
+        # this is a fast solution and can be improved:
+        numpy_row_idx = row_idx.cpu().numpy()
+        # in the following line we draw a node for each entry of row_idx, but we only draw nodes that holds the condition above
+        # this line also has a problem when there is at least one node for which no other node holds sample_node_space > node
+        # this means we would try to sample from an empty set
+        # WE WILL SKIP THIS METHOD entirley unless we get a problem with the alternative way
+        col_idx = torch.tensor([np.random.choice(sample_node_space[sample_node_space > node],
+                                                 size=1, replace=True) for node in numpy_row_idx])
+        # this ensures that we generate a triu undirected matrix
+        row_idx = torch.from_numpy(row_idx)
+        edges_idx = torch.cat([row_idx.unsqueeze(0), col_idx.T], dim=0)
+
+        # CONCERNS: this method could be computational inefficient for large sample_node_space
+        # I will not include this method yet
+        return edges_idx
