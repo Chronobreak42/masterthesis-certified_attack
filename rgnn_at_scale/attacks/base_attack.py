@@ -112,7 +112,7 @@ class Attack(ABC):
     def _attack(self, n_perturbations: int, **kwargs):
         pass
 
-    def attack(self, n_perturbations: int, use_cert: str = "none", grid_radii: Optional[np.ndarray] = None, grid_binary_class: Optional[np.ndarray] = None, **kwargs):
+    def attack(self, n_perturbations: int, semi: bool, use_cert: str = "none", grid_radii: Optional[np.ndarray] = None, grid_binary_class: Optional[np.ndarray] = None, **kwargs):
         """
         Executes the attack on the model updating the attributes
         self.adj_adversary and self.attr_adversary accordingly.
@@ -123,7 +123,7 @@ class Attack(ABC):
             number of perturbations (attack budget in terms of node additions/deletions) that constrain the atack
         """
         if n_perturbations > 0:
-            return self._attack(n_perturbations, **kwargs, use_cert=use_cert, grid_radii=grid_radii, grid_binary_class=grid_binary_class)
+            return self._attack(n_perturbations, **kwargs, semi=semi, use_cert=use_cert, grid_radii=grid_radii, grid_binary_class=grid_binary_class)
         else:
             self.attr_adversary = self.attr
             self.adj_adversary = self.adj

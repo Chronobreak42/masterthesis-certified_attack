@@ -95,7 +95,7 @@ def prepare_attack_experiment(data_dir: str, dataset: str, attack: str, attack_p
 
 
 def run_global_attack(epsilon, m, storage, pert_adj_storage_type, pert_attr_storage_type,
-                      pert_params, adversary, model_label, use_cert, grid_radii: Optional[np.ndarray] = None, grid_binary_class: Optional[np.ndarray] = None):
+                      pert_params, adversary, model_label,semi, use_cert, grid_radii: Optional[np.ndarray] = None, grid_binary_class: Optional[np.ndarray] = None):
     n_perturbations = int(round(epsilon * m))
 
     pert_adj = storage.load_artifact(pert_adj_storage_type, {**pert_params, **{'epsilon': epsilon}})
@@ -107,7 +107,7 @@ def run_global_attack(epsilon, m, storage, pert_adj_storage_type, pert_attr_stor
         adversary.set_pertubations(pert_adj, pert_attr)
     else:
         logging.info(f"No cached perturbations found for model '{model_label}' and eps {epsilon}. Execute attack...")
-        adversary.attack(n_perturbations, use_cert = use_cert, grid_radii = grid_radii, grid_binary_class = grid_binary_class)
+        adversary.attack(n_perturbations, semi = semi, use_cert = use_cert, grid_radii = grid_radii, grid_binary_class = grid_binary_class)
         pert_adj, pert_attr = adversary.get_pertubations()
 
         if n_perturbations > 0:
