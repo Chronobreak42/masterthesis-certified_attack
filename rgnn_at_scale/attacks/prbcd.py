@@ -344,7 +344,12 @@ class PRBCD(SparseAttack):
 
     def sample_block_from_certificates_radii(self, grid_radii, n_perturbations: int = 0):
         for _ in range(self.max_final_samples):
-            self.current_node_search_space = np.where(grid_radii[:, 2, 2] == False)[0]
+
+            false_counts = np.sum(grid_radii == False, axis=(1, 2))
+            top_n_indices = np.argsort(-false_counts)[:n_perturbations]  # negative sign for descending order
+            self.current_node_search_space = top_n_indices
+
+            # self.current_node_search_space = np.where(grid_radii[:, 2, 2] == False)[0]
 
             # draw edges: draw nodes from current_node_search_space and concatenate
             # First attempt
