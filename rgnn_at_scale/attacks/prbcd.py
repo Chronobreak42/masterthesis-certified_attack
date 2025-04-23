@@ -68,6 +68,7 @@ class PRBCD(SparseAttack):
             Number of edges to be perturbed (assuming an undirected graph)
         """
         self.semi = semi
+        self.current_node_search_space = np.where(grid_radii[:, 2, 2] == False)[0]
         assert self.block_size > n_perturbations, \
             f'The search space size ({self.block_size}) must be ' \
             + f'greater than the number of permutations ({n_perturbations})'
@@ -87,7 +88,7 @@ class PRBCD(SparseAttack):
         else:
             self.sample_random_block(n_perturbations)
 
-        # Accuracy and attack statistics before the attach even started
+        # Accuracy and attack statistics before the attack even started
         with torch.no_grad():
             logits = self._get_logits(self.attr, self.edge_index, self.edge_weight)
             loss = self.calculate_loss(logits[self.idx_attack], self.labels[self.idx_attack])
@@ -344,7 +345,7 @@ class PRBCD(SparseAttack):
 
     def sample_block_from_certificates_radii(self, grid_radii, n_perturbations: int = 0):
         for _ in range(self.max_final_samples):
-            self.current_node_search_space = np.where(grid_radii[:, 2, 2] == False)[0]
+            #self.current_node_search_space = np.where(grid_radii[:, 2, 2] == False)[0] #moved this to the beginning
 
             # draw edges: draw nodes from current_node_search_space and concatenate
             # First attempt
@@ -443,7 +444,7 @@ class PRBCD(SparseAttack):
         raise RuntimeError('Sampling random block was not successfull. Please decrease `n_perturbations`.')
 
     def resample_random_block_from_cert_radii(self, grid_radii, n_perturbations: int = 0): #TODO: still work to be done
-        self.current_node_search_space = np.where(grid_radii[:, 2, 2] == False)[0]
+        #self.current_node_search_space = np.where(grid_radii[:, 2, 2] == False)[0] #moved this to beginning
         if self.keep_heuristic == 'WeightOnly':
             sorted_idx = torch.argsort(self.perturbed_edge_weight)
             idx_keep = (self.perturbed_edge_weight <= self.eps).sum().long()

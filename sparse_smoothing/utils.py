@@ -249,7 +249,8 @@ def sparse_perturb_multiple(data_idx, pf_minus, pf_plus, n, m, undirected, nsamp
     if offset_both_idx:
         assert n == m
         nadd_persample_np = np.random.binomial(n * m, pf_plus, size=nsamples)  # 6x faster than PyTorch
-        nadd_persample = torch.cuda.FloatTensor(nadd_persample_np)
+        #nadd_persample = torch.cuda.FloatTensor(nadd_persample_np)
+        nadd_persample = torch.FloatTensor(nadd_persample_np)
         nadd_persample_with_repl = torch.round(torch.log(1 - nadd_persample / (n * m))
                                                / np.log(1 - 1 / (n * m))).long()
         nadd_with_repl = nadd_persample_with_repl.sum()
