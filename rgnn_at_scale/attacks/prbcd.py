@@ -467,7 +467,6 @@ class PRBCD(SparseAttack):
         for i in range(self.max_final_samples):
             n_edges_resample = self.block_size - self.current_search_space.size(0)
 
-            #TODO: Pönki schau bitte ob alles stimmt
             # resample new edges
             if not self.semi:
                 self.build_full_idx_matrix(True, n_edges_resample)
