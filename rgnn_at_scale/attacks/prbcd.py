@@ -81,9 +81,9 @@ class PRBCD(SparseAttack):
         self.attack_statistics = defaultdict(list)
 
         # Sample initial search space (Algorithm 1, line 3-4)
-        if use_cert in ("sampling_grid_radii", "both"):
+        if use_cert in ("sampling_grid_radii", "both_1"):
             self.sample_block_from_certificates_radii(grid_radii=grid_radii, n_perturbations=n_perturbations)
-        elif use_cert in ("sampling_grid_binary_class"):
+        elif use_cert in ("sampling_grid_binary_class", "both_2"):
             self.sample_block_from_certificates_binary_class(grid_binary_class=grid_binary_class, n_perturbations=n_perturbations)
         else:
             self.sample_random_block(n_perturbations)
@@ -154,7 +154,7 @@ class PRBCD(SparseAttack):
 
                 # Resampling of search space (Algorithm 1, line 9-14)
                 if epoch < self.epochs_resampling - 1:
-                    if use_cert in ("resampling", "both"):
+                    if use_cert in ("resampling", "both_1", "both_2"):
                         self.resample_random_block_from_cert_radii(grid_radii=grid_radii,
                                                                    n_perturbations=n_perturbations)  # TODO: Hier kommen die grid_radii rein.
                     else:
@@ -348,9 +348,9 @@ class PRBCD(SparseAttack):
             #self.current_node_search_space = np.where(grid_radii[:, 2, 2] == False)[0] #moved this to the beginning
 
             #### TESTING ####
-            false_counts = np.sum(grid_radii == False, axis=(1, 2))
-            top_n_indices = np.argsort(-false_counts)[:n_perturbations]  # negative sign for descending order
-            self.current_node_search_space = top_n_indices
+            #false_counts = np.sum(grid_radii == False, axis=(1, 2))
+            #top_n_indices = np.argsort(-false_counts)[:n_perturbations]  # negative sign for descending order
+            #self.current_node_search_space = top_n_indices
             ####^^^^ TESTING ^^^^
             # self.current_node_search_space = np.where(grid_radii[:, 2, 2] == False)[0]
 
@@ -384,16 +384,25 @@ class PRBCD(SparseAttack):
 
     def sample_block_from_certificates_binary_class(self, grid_binary_class, n_perturbations: int = 0):
         for _ in range(self.max_final_samples):
+
             sums = np.sum(grid_binary_class, axis=(1, 2))  # shape: (2810,)
             smallest_indices = np.argsort(sums)[:self.block_size]
-            self.current_search_space = torch.from_numpy(smallest_indices)
-            if self.make_undirected:
-                self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+            self.current_node_search_space = torch.from_numpy(smallest_indices)
+
+            # draw edges: draw nodes from current_node_search_space and concatenate
+            # First attempt
+            if not self.semi:
+                edges_idx = self.build_full_idx_matrix(False, self.block_size)
             else:
-                self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
-                is_not_self_loop = self.modified_edge_index[0] != self.modified_edge_index[1]
-                self.current_search_space = self.current_search_space[is_not_self_loop]
-                self.modified_edge_index = self.modified_edge_index[:, is_not_self_loop]
+                self.build_full_idx_matrix_semi(False, self.block_size)
+            # bis hierhin wird für die gesamte Blockmatrix gezogen
+
+            if self.make_undirected:
+                # make undirected: cut all (x,y) where x >= y
+                self.setup_search_space_undirected(self.n)
+            else:
+                # TODO: i have not checked if it works for the directed case, I think it will NOT work
+                self.modified_edge_index = PRBCD.cut_diagonal_entries(edges_idx)
 
             self.perturbed_edge_weight = torch.full_like(
                 self.current_search_space, self.eps, dtype=torch.float32, requires_grad=True
