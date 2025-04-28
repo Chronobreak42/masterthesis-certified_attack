@@ -67,7 +67,9 @@ class PRBCD(SparseAttack):
         n_perturbations : int
             Number of edges to be perturbed (assuming an undirected graph)
         """
+
         self.semi = semi
+        self.use_cert = use_cert
         assert self.block_size > n_perturbations, \
             f'The search space size ({self.block_size}) must be ' \
             + f'greater than the number of permutations ({n_perturbations})'
@@ -383,9 +385,13 @@ class PRBCD(SparseAttack):
     def sample_block_from_certificates_binary_class(self, grid_binary_class, n_perturbations: int = 0):
         for _ in range(self.max_final_samples):
 
-            sums = np.sum(grid_binary_class, axis=(1, 2))  # shape: (2810,)
-            smallest_indices = np.argsort(sums)[:len(sums) // 2]
-            self.current_node_search_space = torch.from_numpy(smallest_indices)
+            if self.use_cert in ("sampling_grid_binary_class_alt",):
+                print("using alternative current_node_search_space sampling")
+                self.sample_current_node_search_space_det(grid_binary_class)
+            else:
+                sums = np.sum(grid_binary_class, axis=(1, 2))  # shape: (2810,)
+                smallest_indices = np.argsort(sums)[:len(sums) // 2]
+                self.current_node_search_space = torch.from_numpy(smallest_indices)
 
             # draw edges: draw nodes from current_node_search_space and concatenate
             if not self.semi:
@@ -657,10 +663,10 @@ class PRBCD(SparseAttack):
         return lin_idx
 
     def sample_current_node_search_space_det(self, grid_binary_class):
-        unrobost_nodes_lin_index = np.where(grid_binary_class < 0.25)  # shape: (2810,)
+        # this does not work as every has atleast one grid where this is true
+        unrobost_nodes_lin_index = np.where(grid_binary_class[:, 0:3, 0:3] < 0.1)  # shape: (2810,)
         unrobost_nodes_lin_index = unrobost_nodes_lin_index[0]
-        unrobost_nodes_lin_index = torch.unique(unrobost_nodes_lin_index, sorted=False)
-        self.current_node_search_space = torch.from_numpy(unrobost_nodes_lin_index)
+        self.current_node_search_space = torch.unique(torch.from_numpy(unrobost_nodes_lin_index), sorted=False)
         return
 
     def _append_attack_statistics(self, loss: float, accuracy: float,
