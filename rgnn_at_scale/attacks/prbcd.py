@@ -67,7 +67,6 @@ class PRBCD(SparseAttack):
         n_perturbations : int
             Number of edges to be perturbed (assuming an undirected graph)
         """
-
         self.semi = semi
         self.use_cert = use_cert
         assert self.block_size > n_perturbations, \
@@ -82,10 +81,9 @@ class PRBCD(SparseAttack):
         self.attack_statistics = defaultdict(list)
 
         # Sample initial search space (Algorithm 1, line 3-4)
-        if use_cert in ("sampling_grid_radii", "both_1"):
-            print(use_cert, "run sampling_grid_radii")
+        if use_cert in ("sampling_grid_radii", "sampling_grid_radii_alt_11", "sampling_grid_radii_alt_10", "sampling_grid_radii_alt_02", "both_1"):
             self.sample_block_from_certificates_radii(grid_radii=grid_radii, n_perturbations=n_perturbations)
-        elif use_cert in ("sampling_grid_binary_class", "both_2"):
+        elif use_cert in ("sampling_grid_binary_class", "sampling_grid_binary_class_alt", "both_2"):
             print(use_cert, "run sampling_grid_binary_class")
             self.sample_block_from_certificates_binary_class(grid_binary_class=grid_binary_class, n_perturbations=n_perturbations)
         else:
@@ -355,8 +353,13 @@ class PRBCD(SparseAttack):
 
     def sample_block_from_certificates_radii(self, grid_radii, n_perturbations: int = 0):
         for _ in range(self.max_final_samples):
-            self.current_node_search_space = np.where(grid_radii[:, 2, 2] == False)[0]
-
+            # Tried different grid_cells to use for. [1,1] and [2,2] showed best results (determined with 5 examples each)
+            if self.use_cert in ("sampling_grid_radii_alt_11",):
+                print(self.use_cert, "run sampling_grid_radii_alt_11")
+                self.current_node_search_space = np.where(grid_radii[:, 1, 1] == False)[0]
+            else:
+                print(self.use_cert, "run sampling_grid_radii")
+                self.current_node_search_space = np.where(grid_radii[:, 2, 2] == False)[0]
             # draw edges: draw nodes from current_node_search_space and concatenate
             # TODO: The following lines till setup_search_space_undirected could be improved in terms of readability, change method outputs
             if not self.semi:
@@ -367,14 +370,16 @@ class PRBCD(SparseAttack):
 
             if self.make_undirected:
                 # make undirected: cut all (x,y) where x >= y
-                self.setup_search_space_undirected(self.n)
+                self.current_search_space = self.edges_to_current_search_space(self.n)
+                self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+
+                # self.setup_search_space_undirected(self.n) with the two lines above this method is NOT needed anymore
                 # TODO: This will cut arbitrary number of entries, I made a function draw_undirected_matrix() to bypass this, but may be slow
                 # maybe return later to this idea
             else:
                 # TODO: i have not checked if it works for the directed case, I think it will NOT work
                 self.modified_edge_index = PRBCD.cut_diagonal_entries(edges_idx)
 
-            #self.current_search_space = PRBCD.full_to_linear_idx(self.n, self.modified_edge_index)
             self.perturbed_edge_weight = torch.full_like(
                 self.current_search_space, self.eps, dtype=torch.float32, requires_grad=True
             )
@@ -402,7 +407,9 @@ class PRBCD(SparseAttack):
 
             if self.make_undirected:
                 # make undirected: cut all (x,y) where x >= y
-                self.setup_search_space_undirected(self.n)
+                self.current_search_space = self.edges_to_current_search_space(self.n)
+                self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+                # self.setup_search_space_undirected(self.n) this method is not needed anymore
             else:
                 # TODO: i have not checked if it works for the directed case, I think it will NOT work
                 self.modified_edge_index = PRBCD.cut_diagonal_entries(edges_idx)
@@ -463,7 +470,8 @@ class PRBCD(SparseAttack):
         raise RuntimeError('Sampling random block was not successfull. Please decrease `n_perturbations`.')
 
     def resample_random_block_from_cert_radii(self, grid_radii, n_perturbations: int = 0): #TODO: still work to be done
-        self.current_node_search_space = np.where(grid_radii[:, 2, 2] == False)[0]
+        #self.current_node_search_space = np.where(grid_radii[:, 2, 2] == False)[0]
+        self.current_node_search_space = np.where(grid_radii[:, 1, 1] == False)[0]
         if self.keep_heuristic == 'WeightOnly':
             sorted_idx = torch.argsort(self.perturbed_edge_weight)
             idx_keep = (self.perturbed_edge_weight <= self.eps).sum().long()
@@ -638,25 +646,26 @@ class PRBCD(SparseAttack):
         # from here we want to follow same steps as sample_random_block
         self.current_search_space = self.edges_to_current_search_space(n)
 
-        while self.current_search_space.size(0) < self.block_size:
-            # here we want to fill up current_search_space so that there are block_size many entries
-            if not self.semi:
-                self.build_full_idx_matrix(False, self.block_size)
-            else:
-                self.build_full_idx_matrix_semi(False, self.block_size)
-            self.current_search_space = self.edges_to_current_search_space(n)
+        #while self.current_search_space.size(0) < self.block_size:
+        #    # here we want to fill up current_search_space so that there are block_size many entries
+        #    if not self.semi:
+        #        self.build_full_idx_matrix(False, self.block_size)
+        #    else:
+        #        self.build_full_idx_matrix_semi(False, self.block_size)
+        #    self.current_search_space = self.edges_to_current_search_space(n)
 
         # now we follow same steps as sample_random_block
-        self.current_search_space = self.current_search_space[
-                                        torch.randperm(self.current_search_space.size(0))[:self.block_size]
-                                        ]
+        #self.current_search_space = self.current_search_space[
+        #                                torch.randperm(self.current_search_space.size(0))[:self.block_size]
+        #                                ]
         self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+        # if the new logic is usable this method is redundant
         return
 
     def edges_to_current_search_space(self, n: int):
         # first we cut edges so that index build a triu matrix
         # (function triu_idx_to_linear only support triu matrix idx)
-        self.edges_to_attack_index = PRBCD.cut_matrix_idx_to_triu_idx(self.edges_to_attack_index)
+        self.edges_to_attack_index = PRBCD.flip_matrix_idx_to_triu_idx(self.edges_to_attack_index)
         # we then build linear idx which is the current_search_space
         lin_idx = PRBCD.triu_idx_to_linear_idx(n, self.edges_to_attack_index)
         lin_idx = torch.unique(lin_idx, sorted=True)
@@ -685,6 +694,18 @@ class PRBCD(SparseAttack):
         mask = row_idx < col_idx
         #returns undirected triu matrix
         return matrix[:, mask]
+
+    @staticmethod
+    def flip_matrix_idx_to_triu_idx(matrix: torch.tensor) -> torch.tensor:
+        matrix = PRBCD.cut_diagonal_entries(matrix)
+        row_idx = matrix[0]
+        col_idx = matrix[1]
+        # flip all entries of matrix where the entry (x,y) holds x>y
+        mask = row_idx > col_idx
+        temp = col_idx[mask]
+        col_idx[mask] = row_idx[mask]
+        row_idx[mask] = temp
+        return matrix
 
     @staticmethod
     def cut_diagonal_entries(matrix: torch.tensor) -> torch.Tensor:
