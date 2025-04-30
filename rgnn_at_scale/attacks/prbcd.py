@@ -81,7 +81,7 @@ class PRBCD(SparseAttack):
         self.attack_statistics = defaultdict(list)
 
         # Sample initial search space (Algorithm 1, line 3-4)
-        if use_cert in ("sampling_grid_radii", "sampling_grid_radii_alt_11", "sampling_grid_radii_alt_10", "sampling_grid_radii_alt_02", "both_1"):
+        if use_cert in ("sampling_grid_radii", "sampling_grid_radii_alt_11", "both_1"):
             self.sample_block_from_certificates_radii(grid_radii=grid_radii, n_perturbations=n_perturbations)
         elif use_cert in ("sampling_grid_binary_class", "sampling_grid_binary_class_alt", "both_2"):
             print(use_cert, "run sampling_grid_binary_class")
