@@ -81,9 +81,9 @@ class PRBCD(SparseAttack):
         self.attack_statistics = defaultdict(list)
 
         # Sample initial search space (Algorithm 1, line 3-4)
-        if use_cert in ("sampling_grid_radii", "sampling_grid_radii_alt_11", "both_1"):
+        if use_cert in ("sampling_grid_radii", "sampling_grid_radii_alt_11", "both_1", "both_2_random"):
             self.sample_block_from_certificates_radii(grid_radii=grid_radii, n_perturbations=n_perturbations)
-        elif use_cert in ("sampling_grid_binary_class", "sampling_grid_binary_class_alt", "both_2"):
+        elif use_cert in ("sampling_grid_binary_class", "sampling_grid_binary_class_alt_11", "sampling_grid_binary_class_alt_22", "both_2"):
             print(use_cert, "run sampling_grid_binary_class")
             self.sample_block_from_certificates_binary_class(grid_binary_class=grid_binary_class, n_perturbations=n_perturbations)
         else:
@@ -160,7 +160,7 @@ class PRBCD(SparseAttack):
                         print(use_cert, "run resampling_grid_radii")
                         self.resample_random_block_from_cert_radii(grid_radii=grid_radii,
                                                                    n_perturbations=n_perturbations)
-                    elif use_cert in ("resampling_grid_binary_class", "both_2"):
+                    elif use_cert in ("resampling_grid_binary_class", "both_2", "both_2_random"):
                         print(use_cert, "run resampling_grid_binary_class")
                         self.resample_random_block_from_cert_binary_class(grid_binary_class=grid_binary_class,
                                                                   n_perturbations=n_perturbations)
@@ -192,7 +192,7 @@ class PRBCD(SparseAttack):
         ).coalesce().detach()
         self.attr_adversary = self.attr
 
-        # TODO: Don't we want to switch to returning things?
+        # TODO: Don't we want to switch to returning things? Haha yeah me too
 
     def _get_logits(self, attr: torch.Tensor, edge_index: torch.Tensor, edge_weight: torch.Tensor):
         return self.attacked_model(
@@ -390,7 +390,7 @@ class PRBCD(SparseAttack):
     def sample_block_from_certificates_binary_class(self, grid_binary_class, n_perturbations: int = 0):
         for _ in range(self.max_final_samples):
 
-            if self.use_cert in ("sampling_grid_binary_class_alt",):
+            if self.use_cert in ("sampling_grid_binary_class_alt_11", "sampling_grid_binary_class_alt_22"):
                 print("using alternative current_node_search_space sampling")
                 self.sample_current_node_search_space_det(grid_binary_class)
             else:
@@ -540,9 +540,11 @@ class PRBCD(SparseAttack):
         self.modified_edge_index = self.modified_edge_index[:, sorted_idx]
         self.perturbed_edge_weight = self.perturbed_edge_weight[sorted_idx]
 
-        sums = np.sum(grid_binary_class, axis=(1, 2))  # shape: (2810,)
-        smallest_indices = np.argsort(sums)[:len(sums) // 2]
-        self.current_node_search_space = torch.from_numpy(smallest_indices)
+        # sums = np.sum(grid_binary_class, axis=(1, 2))  # shape: (2810,)
+        # smallest_indices = np.argsort(sums)[:len(sums) // 2]
+        # self.current_node_search_space = torch.from_numpy(smallest_indices)
+        # testing a random sample pattern
+        self.sample_current_node_search_space_random_cert(grid_binary_class, 1000)
 
         # Sample until enough edges were drawn
         for i in range(self.max_final_samples):
@@ -672,10 +674,27 @@ class PRBCD(SparseAttack):
         return lin_idx
 
     def sample_current_node_search_space_det(self, grid_binary_class):
-        # this does not work as every has atleast one grid where this is true
-        unrobost_nodes_lin_index = np.where(grid_binary_class[:, 0:3, 0:3] < 0.1)  # shape: (2810,)
-        unrobost_nodes_lin_index = unrobost_nodes_lin_index[0]
-        self.current_node_search_space = torch.unique(torch.from_numpy(unrobost_nodes_lin_index), sorted=False)
+        if self.use_cert in ("sampling_grid_binary_class_alt_11",):
+            print("running alternative sampling with grid binary class (1,1)")
+            unrobust_nodes_lin_index = np.where(grid_binary_class[:, 1, 1] < 0.3)  # shape: (2810,)
+        else:
+            print("running alternative sampling with grid binary class (2,2)")
+            unrobust_nodes_lin_index = np.where(grid_binary_class[:, 2, 2] < 0.2)
+        unrobust_nodes_lin_index = unrobust_nodes_lin_index[0]
+        self.current_node_search_space = torch.unique(torch.from_numpy(unrobust_nodes_lin_index), sorted=False)
+        return
+
+    def sample_current_node_search_space_random_cert(self, grid_binary_class, sample_size):
+        search_space = np.array([], dtype=np.int64)
+        print("running random certificate samples")
+        while search_space.shape[0] < sample_size:
+            unrobust_nodes_lin_idx = np.where(grid_binary_class[:,
+                                              np.random.randint(0, 3),
+                                              np.random.randint(0, 3)] < np.random.uniform(0.1, 0.4))
+            unrobust_nodes_lin_idx = unrobust_nodes_lin_idx[0]
+            search_space = np.concatenate([search_space, unrobust_nodes_lin_idx], axis=0)
+
+        self.current_node_search_space = torch.unique(torch.from_numpy(search_space), sorted=False)
         return
 
     def _append_attack_statistics(self, loss: float, accuracy: float,
