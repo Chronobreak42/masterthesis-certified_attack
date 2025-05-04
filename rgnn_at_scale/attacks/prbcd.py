@@ -543,11 +543,11 @@ class PRBCD(SparseAttack):
         # sums = np.sum(grid_binary_class, axis=(1, 2))  # shape: (2810,)
         # smallest_indices = np.argsort(sums)[:len(sums) // 2]
         # self.current_node_search_space = torch.from_numpy(smallest_indices)
-        # testing a random sample pattern
-        self.sample_current_node_search_space_random_cert(grid_binary_class, 1000)
 
         # Sample until enough edges were drawn
         for i in range(self.max_final_samples):
+            # testing a random sample pattern
+            self.sample_current_node_search_space_random_cert(grid_binary_class, 1000)
             n_edges_resample = self.block_size - self.current_search_space.size(0)
 
             # resample new edges
@@ -687,10 +687,11 @@ class PRBCD(SparseAttack):
     def sample_current_node_search_space_random_cert(self, grid_binary_class, sample_size):
         search_space = np.array([], dtype=np.int64)
         print("running random certificate samples")
-        while search_space.shape[0] < sample_size:
+        # Todo: Try different setups like different sample_size, while loop only to ensure no empty search_space, etc.
+        while search_space.shape[0] <= 0:
             unrobust_nodes_lin_idx = np.where(grid_binary_class[:,
                                               np.random.randint(0, 3),
-                                              np.random.randint(0, 3)] < np.random.uniform(0.1, 0.4))
+                                              np.random.randint(0, 5)] < np.random.uniform(0.1, 0.4))
             unrobust_nodes_lin_idx = unrobust_nodes_lin_idx[0]
             search_space = np.concatenate([search_space, unrobust_nodes_lin_idx], axis=0)
 
