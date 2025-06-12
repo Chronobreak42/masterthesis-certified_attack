@@ -53,6 +53,8 @@ class PRBCD(SparseAttack):
         self.perturbed_edge_weight: torch.Tensor = None
         self.semi = None
         self.score = None
+        self.degrees = None
+        self.weights_p = None
 
         if self.make_undirected:
             self.n_possible_edges = self.n * (self.n - 1) // 2
@@ -72,6 +74,7 @@ class PRBCD(SparseAttack):
         self.semi = semi
         self.use_cert = use_cert
         self.score = self.compute_score(grid_radii)
+        self.degrees = torch.bincount(self.edge_index.flatten(), minlength=self.n)
         assert self.block_size > n_perturbations, \
             f'The search space size ({self.block_size}) must be ' \
             + f'greater than the number of permutations ({n_perturbations})'
@@ -89,7 +92,7 @@ class PRBCD(SparseAttack):
         elif use_cert in ("sampling_grid_binary_class", "sampling_grid_binary_class_alt_11", "sampling_grid_binary_class_alt_22", "both_2"):
             print(use_cert, "run sampling_grid_binary_class")
             self.sample_block_from_certificates_binary_class(grid_binary_class=grid_binary_class, n_perturbations=n_perturbations)
-        elif use_cert in ("sampling_with_score", "both_3"):
+        elif use_cert in ("sampling_with_score", "sampling_with_score_degree", "both_3"):
             print(use_cert, "run sample_block_from_score")
             self.sample_block_from_score(n_perturbations)
         else:
@@ -170,8 +173,8 @@ class PRBCD(SparseAttack):
                         print(use_cert, "run resampling_grid_binary_class")
                         self.resample_random_block_from_cert_binary_class(grid_binary_class=grid_binary_class,
                                                                   n_perturbations=n_perturbations)
-                    elif use_cert in ("resampling_with_score", "both_3"):
-                        print(use_cert, "run resample_block_from_score")
+                    elif use_cert in ("resampling_with_score", "resampling_with_score_degree", "both_3"):
+                        print("run", use_cert)
                         self.resample_random_block_from_score(n_perturbations=n_perturbations)
                     else:
                         print(use_cert, "run resampling with no certificate")
@@ -738,18 +741,23 @@ class PRBCD(SparseAttack):
         if reset:
             # empty edges_to_attack_index for resample or other cases
             self.edges_to_attack_index = torch.empty((2, 0), dtype=torch.long)
-        ones = np.ones_like(self.score, dtype=float)
-        weights_p = ones / self.score
-        weights_p = torch.pow(torch.from_numpy(weights_p), 2)
-        nodes_1 = torch.tensor(random.choices(self.current_node_search_space, weights=weights_p,  k=sample_size))
+        #TODO: Refactor! these computation can be outsosurced so it is only runned once!!
+        if self.weights_p is None:
+            print("Calculating weights_p")
+            ones = np.ones_like(self.score, dtype=float)
+            self.weights_p = torch.from_numpy(ones / self.score)
+            self.weights_p = torch.pow(self.weights_p, 2)
+            if self.use_cert in ("sampling_with_score_degree", "resampling_with_score_degree"):
+                print("using degree/score")
+                self.weights_p = self.degrees + self.weights_p
+        nodes_1 = torch.tensor(random.choices(self.current_node_search_space, weights=self.weights_p,  k=sample_size))
         if self.semi:
             nodes_2 = torch.randint(self.n, (sample_size,), device=self.device)
         else:
-            nodes_2 = torch.tensor(random.choices(self.current_node_search_space, weights=weights_p,  k=sample_size))
+            nodes_2 = torch.tensor(random.choices(self.current_node_search_space, weights=self.weights_p,  k=sample_size))
         edges_idx = torch.cat([nodes_1.unsqueeze(0), nodes_2.unsqueeze(0)], dim=0)
         self.edges_to_attack_index = torch.cat([self.edges_to_attack_index, edges_idx], dim=1)
         return edges_idx
-
 
     def compute_score(self, certificate):
         _, num_rows, num_cols = certificate.shape
