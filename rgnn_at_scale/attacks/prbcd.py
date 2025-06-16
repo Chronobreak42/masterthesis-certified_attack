@@ -4,6 +4,7 @@ from collections import defaultdict
 import math
 from typing import Tuple, Optional
 
+import pandas as pd
 from tqdm import tqdm
 import numpy as np
 import torch
@@ -175,6 +176,12 @@ class PRBCD(SparseAttack):
                     self.modified_edge_index = best_edge_index.to(self.device)
                     self.perturbed_edge_weight = best_edge_weight_diff.to(self.device)
                     self.perturbed_edge_weight.requires_grad = True
+
+        #_edge_to_node_transfer = PRBCD.linear_to_triu_idx(self.modified_edge_index)
+
+        #row_idx, col_idx = _edge_to_node_transfer[0], _edge_to_node_transfer[1] TODO: hier könnte man die nodes die noch übrig sind nach dem Angriff evaluaten
+
+        #self.nodes_after_attack = pd.concat([row_idx, col_idx])
 
         # Retreive best epoch if early stopping is active (not explicitly covered by pesudo code)
         if self.with_early_stopping:
