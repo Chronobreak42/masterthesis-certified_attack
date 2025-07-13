@@ -104,4 +104,4 @@ def eval_epoch(model, decoder, edge_index,
                         decoder(z, neg_edge)])
     labels = torch.cat([torch.ones(pos_edge.size(1)),
                         torch.zeros(neg_edge.size(1))]).to(logits.device)
-    return metric_fn(logits.cpu().sigmoid(), labels.cpu())
+    return metric_fn(labels.cpu().numpy(), logits.cpu().sigmoid().numpy())

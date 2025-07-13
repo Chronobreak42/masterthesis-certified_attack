@@ -96,6 +96,7 @@ def prepare_attack_experiment(data_dir: str, dataset: str, attack: str, attack_p
 
 def run_global_attack(epsilon, m, storage, pert_adj_storage_type, pert_attr_storage_type,
                       pert_params, adversary, model_label,semi, use_cert, grid_radii: Optional[np.ndarray] = None, grid_binary_class: Optional[np.ndarray] = None):
+
     n_perturbations = int(round(epsilon * m))
 
     pert_adj = storage.load_artifact(pert_adj_storage_type, {**pert_params, **{'epsilon': epsilon}})
@@ -107,13 +108,14 @@ def run_global_attack(epsilon, m, storage, pert_adj_storage_type, pert_attr_stor
         adversary.set_pertubations(pert_adj, pert_attr)
     else:
         logging.info(f"No cached perturbations found for model '{model_label}' and eps {epsilon}. Execute attack...")
-        adversary.attack(n_perturbations, semi = semi, use_cert = use_cert, grid_radii = grid_radii, grid_binary_class = grid_binary_class)
+        gradient = adversary.attack(n_perturbations, semi = semi, use_cert = use_cert, grid_radii = grid_radii, grid_binary_class = grid_binary_class)
         pert_adj, pert_attr = adversary.get_pertubations()
 
         if n_perturbations > 0:
             storage.save_artifact(pert_adj_storage_type, {**pert_params, **{'epsilon': epsilon}}, pert_adj)
             storage.save_artifact(pert_attr_storage_type, {**pert_params, **{'epsilon': epsilon}}, pert_attr)
 
+    return gradient
 
 def sample_attack_nodes(logits: torch.Tensor, labels: torch.Tensor, nodes_idx,
                         adj: SparseTensor, topk: int, min_node_degree: int):
@@ -157,7 +159,7 @@ def get_local_attack_nodes(attr, adj, labels, surrogate_model, idx_test, device,
         surrogate_model = surrogate_model.to(device)
         surrogate_model.eval()
         if type(surrogate_model) in BATCHED_PPR_MODELS.__args__:
-            logits = surrogate_model.forward(attr, adj, ppr_idx=np.array(idx_test))
+            logits = surrogate_model.forward(attr, adj, ppr_idx=np.array(idx_test)) #TODO: hier habe ich die matrix transposed??????
         else:
             logits = surrogate_model(attr.to(device), adj.to(device))[idx_test]
 

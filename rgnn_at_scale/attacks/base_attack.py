@@ -128,6 +128,8 @@ class Attack(ABC):
             self.attr_adversary = self.attr
             self.adj_adversary = self.adj
 
+        return self.gradient
+
     def set_pertubations(self, adj_perturbed: Union[SparseTensor, TensorType["n_nodes", "n_nodes"]],
                          attr_perturbed: TensorType["n_nodes", "n_features"]):
         self.adj_adversary = adj_perturbed.to(self.data_device)

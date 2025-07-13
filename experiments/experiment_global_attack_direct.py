@@ -142,7 +142,7 @@ def run(data_dir: str, dataset: str, attack: str, attack_params: Dict[str, Any],
                                   make_undirected=make_undirected, **attack_params)
 
         for epsilon in epsilons:
-            run_global_attack(epsilon, m, storage, pert_adj_storage_type, pert_attr_storage_type,
+            gradient = run_global_attack(epsilon, m, storage, pert_adj_storage_type, pert_attr_storage_type,
                               pert_params, adversary, model_label, semi=semi, use_cert=use_cert, grid_radii=grid_radii, grid_binary_class=grid_binary_class)
 
             adj_adversary = adversary.adj_adversary
@@ -164,5 +164,6 @@ def run(data_dir: str, dataset: str, attack: str, attack_params: Dict[str, Any],
     assert len(results) > 0
 
     return {
-        'results': results
+        'results': results,
+        'gradient': gradient
     }

@@ -51,7 +51,7 @@ def train_val_test_split(
     """
     # --- 1.  Randomly permute edges and slice -----------------------------
     E = edge_index.size(1)
-    perm = torch.randperm(E)
+    perm = torch.randperm(E) #TODO: Permutation wird hammer falsch gezogen
     num_val  = int(E * val_ratio)
     num_test = int(E * test_ratio)
 

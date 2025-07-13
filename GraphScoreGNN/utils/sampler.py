@@ -1,5 +1,21 @@
 import torch
 
+def sample_binary_perm(edge_index):
+    """
+    Randomly samples and deletes edges from the edge index
+
+    Parameters:
+    -----------
+    edge_index: torch.Tensor
+        edge index matrix.
+
+    Returns:
+    --------
+    mod_edge_index: torch.Tensor
+        randomly permutated edge index tensor.
+    """
+
+    mod_edge_index = edge_index.
 
 def sample_negative_edges(
         edge_index: torch.Tensor,

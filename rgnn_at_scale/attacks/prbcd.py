@@ -5,9 +5,11 @@ import math
 from typing import Tuple, Optional
 
 import pandas as pd
+from torch_geometric.nn import GCNConv
 from tqdm import tqdm
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch_sparse
 from torch_sparse import SparseTensor
 
@@ -31,8 +33,13 @@ class PRBCD(SparseAttack):
                  do_synchronize: bool = False,
                  eps: float = 1e-7,
                  max_final_samples: int = 20,
+                 pre_hidden: int = 64, # New
                  **kwargs):
         super().__init__(**kwargs)
+
+        # --- Pre-GNN definition ---
+        # Map original node features to a smaller hidden space
+        self.pre_gnn = GCNConv(self.attr.size(0), pre_hidden)
 
         self.keep_heuristic = keep_heuristic
         self.display_step = display_step
@@ -120,6 +127,7 @@ class PRBCD(SparseAttack):
             loss = self.calculate_loss(logits[self.idx_attack], self.labels[self.idx_attack]) #Todo: Hier wird der loss und gradient für perturbed edge weight erzeugt.
             # Retreive gradient towards the current block (Algorithm 1, line 7)
             gradient = utils.grad_with_checkpoint(loss, self.perturbed_edge_weight)[0]
+            self.gradient = gradient
 
             if torch.cuda.is_available() and self.do_synchronize:
                 torch.cuda.empty_cache()
@@ -201,10 +209,21 @@ class PRBCD(SparseAttack):
 
         # TODO: Don't we want to switch to returning things? Haha yeah me too
 
-    def _get_logits(self, attr: torch.Tensor, edge_index: torch.Tensor, edge_weight: torch.Tensor):
+    def _get_logits(self,
+                    attr: torch.Tensor,
+                    edge_index: torch.Tensor,
+                    edge_weight: torch.Tensor):
+        # --- Stage 1: Pre-GNN step ---
+        x = attr.to(self.device)
+        ei = edge_index.to(self.device)
+        ew = edge_weight.to(self.device)
+        x_pre = self.pre_gnn(x, ei, ew)
+        x_pre = F.relu(x_pre)
+
+        # --- Stage 2: Original attacked_model ---
         return self.attacked_model(
-            data=attr.to(self.device),
-            adj=(edge_index.to(self.device), edge_weight.to(self.device))
+            data=x_pre,
+            adj=(ei, ew)
         )
 
     @torch.no_grad()

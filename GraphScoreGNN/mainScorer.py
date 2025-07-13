@@ -4,10 +4,10 @@ from torch_geometric.datasets import Planetoid
 from torch_geometric.utils import to_undirected
 
 from GraphScoreGNN.data.train_val_test_split import train_val_test_split
-from utils.seed import set_seed
-from models.encoder import GAEEncoder
-from models.decoder import InnerProductDecoder
-from engine.train import train_epoch, eval_epoch
+from GraphScoreGNN.utils.seed import set_seed
+from GraphScoreGNN.models.encoder import GAEEncoder
+from GraphScoreGNN.models.decoder import InnerProductDecoder
+from GraphScoreGNN.engine.train import train_epoch, eval_epoch
 from sklearn.metrics import roc_auc_score
 
 def main():
@@ -21,13 +21,6 @@ def main():
     - Inner-product decoder
     - Binary cross-entropy loss on edge existence (pos/neg)
 
-    Args are parsed via argparse and include:
-    - dataset: dataset name (e.g., "Cora")
-    - embed_dim: dimension of learnable input embeddings
-    - hidden_dim: latent dimension from GCN
-    - lr: learning rate
-    - epochs: number of training iterations
-    - seed: seed for reproducibility
     """
 
     # Argument parser
@@ -50,7 +43,7 @@ def main():
     set_seed(cfg.seed)
 
     # Choose device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cpu')
 
     # Load graph data (no features used)
     data = torch.load(r'E:\Masterarbeit\ProjectCombined\cache\demo\demo_1.pt')
