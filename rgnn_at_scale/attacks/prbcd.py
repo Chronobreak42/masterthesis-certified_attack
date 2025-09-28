@@ -5,13 +5,18 @@ import math
 from typing import Tuple, Optional
 
 import pandas as pd
+import AttackerGNN.PGDTopologyAttack as pgdtop
 from torch_geometric.nn import GCNConv
+from torch_geometric.utils import negative_sampling
 from tqdm import tqdm
 import numpy as np
 import torch
 import torch.nn.functional as F
 import torch_sparse
 from torch_sparse import SparseTensor
+#from AttackerGNN.PreEdgeSelector import PRBCDSelectorGNN
+from AttackerGNN.PriorSelector import PriorSelector
+from AttackerGNN.NodeBlockScorer import NodeBlockScorer
 
 # from rgnn_at_scale.models import MODEL_TYPE
 from rgnn_at_scale.helper import utils
@@ -39,7 +44,25 @@ class PRBCD(SparseAttack):
 
         # --- Pre-GNN definition ---
         # Map original node features to a smaller hidden space
-        self.pre_gnn = GCNConv(self.attr.size(0), pre_hidden)
+        '''
+        self.pre_gnn = PRBCDSelectorGNN(
+                    in_channels = self.attr.shape[1],
+                    hidden_dim = pre_hidden,
+                    num_pairs = 64
+                    )
+        '''
+
+        self.pre_gnn_prior = PriorSelector(
+            in_channels = self.attr.shape[1],
+            hidden_dim = pre_hidden,
+        )
+
+        self.selector = NodeBlockScorer(
+            in_channels=self.attr.shape[1],
+            hidden_dim=pre_hidden,  # reuse your arg
+        ).to(self.device)
+
+        self._margin_trained = False
 
         self.keep_heuristic = keep_heuristic
         self.display_step = display_step
@@ -60,6 +83,16 @@ class PRBCD(SparseAttack):
         self.perturbed_edge_weight: torch.Tensor = None
         self.semi = None
 
+        self.make_pgd_forward_from_victim()
+
+        # --- selector optimizer for online updates at resampling ---
+        if getattr(self, "selector", None) is not None:
+            self.selector_opt = torch.optim.Adam(
+                self.selector.parameters(), lr=1e-3, weight_decay=5e-4
+            )
+        else:
+            self.selector_opt = None
+
         if self.make_undirected:
             self.n_possible_edges = self.n * (self.n - 1) // 2
         else:
@@ -77,6 +110,7 @@ class PRBCD(SparseAttack):
         """
         self.semi = semi
         self.use_cert = use_cert
+
         assert self.block_size > n_perturbations, \
             f'The search space size ({self.block_size}) must be ' \
             + f'greater than the number of permutations ({n_perturbations})'
@@ -94,12 +128,35 @@ class PRBCD(SparseAttack):
         elif use_cert in ("sampling_grid_binary_class", "sampling_grid_binary_class_alt_11", "sampling_grid_binary_class_alt_22", "both_2"):
             print(use_cert, "run sampling_grid_binary_class")
             self.sample_block_from_certificates_binary_class(grid_binary_class=grid_binary_class, n_perturbations=n_perturbations)
+        elif use_cert in ("sampling_with_prior",):
+            print(use_cert, "run sampling_with_prior")
+            self.sample_block_from_prior_gumbel(n_perturbations=n_perturbations, tau=1.0)
+        elif use_cert in ("selector_block",):  # here is my selector
+            print(use_cert, "-> using selector to build the initial block")
+            self.sample_block_from_selector(n_perturbations=n_perturbations, k_nodes=350)
+        elif use_cert in ("selector_block_pgd",):  # here is my selector
+            print(use_cert, "-> using selector to build the initial block")
+            self.sample_block_from_pgdtopk_direct()
         else:
             print(use_cert, "run sampling with no certificate")
             self.sample_random_block(n_perturbations)
 
         # Accuracy and attack statistics before the attack even started
         with torch.no_grad():
+
+            '''
+            self.perturbed_edge_weight.retain_grad()
+            edge_index_dbg, edge_weight_dbg = self.get_modified_adj()
+            edge_weight_dbg.retain_grad()
+            
+
+            print("grad on perturbed_edge_weight:",
+                  None if self.perturbed_edge_weight.grad is None else self.perturbed_edge_weight.grad.abs().sum().item())
+            print("grad on fused edge_weight:",
+                  None if edge_weight_dbg.grad is None else edge_weight_dbg.grad.abs().sum().item())
+            '''
+
+
             logits = self._get_logits(self.attr, self.edge_index, self.edge_weight)
             loss = self.calculate_loss(logits[self.idx_attack], self.labels[self.idx_attack])
             accuracy = utils.accuracy(logits, self.labels, self.idx_attack)
@@ -148,6 +205,7 @@ class PRBCD(SparseAttack):
                 edge_index, edge_weight = self.get_modified_adj()
                 logits = self.attacked_model(data=self.attr.to(self.device), adj=(edge_index, edge_weight))
                 accuracy = utils.accuracy(logits, self.labels, self.idx_attack)
+
                 del edge_index, edge_weight, logits
 
                 if epoch % self.display_step == 0:
@@ -173,6 +231,18 @@ class PRBCD(SparseAttack):
                         print(use_cert, "run resampling_grid_binary_class")
                         self.resample_random_block_from_cert_binary_class(grid_binary_class=grid_binary_class,
                                                                   n_perturbations=n_perturbations)
+                    elif use_cert in ("sampling_with_prior",):
+                        print(use_cert, "run resampling_with_prior")
+                        self.resample_block_from_prior_gumbel(n_perturbations=n_perturbations, tau=1.0)
+
+                    elif use_cert in ("selector_block", "selector_block_pgd"):  # <— add this branch
+                        # guided: one selector step + refill by selector score
+                        self.resample_block_from_selector(
+                            n_perturbations=n_perturbations,
+                            blend_alpha=0.5,  # 0 = pure pred; try 0.5 to blend saliency
+                            prefer_edges="mix",  # 'intra' | 'incident' | 'mix'
+                            max_intra_ratio=0.1
+                        )
                     else:
                         print(use_cert, "run resampling with no certificate")
                         self.resample_random_block(n_perturbations)
@@ -209,21 +279,18 @@ class PRBCD(SparseAttack):
 
         # TODO: Don't we want to switch to returning things? Haha yeah me too
 
-    def _get_logits(self,
-                    attr: torch.Tensor,
-                    edge_index: torch.Tensor,
-                    edge_weight: torch.Tensor):
-        # --- Stage 1: Pre-GNN step ---
-        x = attr.to(self.device)
-        ei = edge_index.to(self.device)
-        ew = edge_weight.to(self.device)
-        x_pre = self.pre_gnn(x, ei, ew)
-        x_pre = F.relu(x_pre)
-
-        # --- Stage 2: Original attacked_model ---
+    def _get_logits(self, x, edge_index, edge_weight):
         return self.attacked_model(
-            data=x_pre,
-            adj=(ei, ew)
+            data=x.to(self.device),
+            adj=(edge_index.to(self.device), edge_weight.to(self.device))
+        )
+
+    def _get_logits_pre_gnn(self, x, edge_index, edge_weight):
+        new_edge_index = self.pre_gnn(x, edge_index, edge_weight)
+        return self.attacked_model(
+            data=x.to(self.device),
+            adj=(new_edge_index.to(self.device),
+                 torch.ones(new_edge_index.shape[1], device=self.device))
         )
 
     @torch.no_grad()
@@ -447,6 +514,1006 @@ class PRBCD(SparseAttack):
                 return
         raise RuntimeError('Sampling random block was not successfull. Please decrease `n_perturbations`.')
 
+    def sample_block_from_prior_gumbel(self, n_perturbations: int = 0, tau: float = 1.0):
+        """
+        Build the initial PR-BCD block by sampling 'block_size' distinct edges
+        from the selector's learned prior with straight-through Gumbel-Softmax.
+        Also record log-probs for policy-gradient updates.
+        """
+        # sample_block_from_prior_gumbel / resample_block_from_prior_gumbel
+
+        logits = self.pre_gnn_prior(self.attr, self.edge_index, self.edge_weight)  # (E,)
+        logits = logits.to(self.device).float()  # <- ensure float dtype
+
+        k = min(self.block_size, logits.numel())
+        selected_idx, logps = [], []
+        mask = torch.zeros_like(logits)
+
+        for _ in range(k):
+            # p = softmax(logits + mask); y ~ ST GumbelSoftmax(p)
+            y = F.gumbel_softmax(logits + mask, tau=tau, hard=True, dim=0)  # (E,)
+            j = int(y.argmax())
+            selected_idx.append(j)
+
+            # log p_j for PG:
+            logp = F.log_softmax(logits + mask, dim=0)[j]
+            logps.append(logp)
+
+            mask[j] = float('-inf')  # forbid duplicates
+
+        sel = torch.tensor(selected_idx, device=self.device, dtype=torch.long)
+
+        # build PR-BCD search block (indices are into self.edge_index)
+        self.current_search_space = sel
+        self.modified_edge_index = self.edge_index[:, sel].to(self.device)
+        self.perturbed_edge_weight = torch.full(
+            (sel.numel(),), self.eps, dtype=torch.float32, requires_grad=True, device=self.device
+        )
+
+        # keep the selector logprobs for PG step this epoch
+        self._selector_log_probs = torch.stack(logps)  # (k,)
+
+        if self.current_search_space.size(0) < n_perturbations:
+            raise RuntimeError("Not enough edges sampled for the requested budget.")
+
+    def _node_saliency_from_victim(self,
+                                   subset: str = "attack",
+                                   loss_type: str = "ce") -> torch.Tensor:
+        """
+        Compute per-node saliency from the victim's classification loss via a
+        node-level gate. Returns a length-N tensor of non-negative saliencies.
+
+        subset: "attack" (= self.idx_attack), "all", or a sequence/tensor of node indices.
+        """
+        # Put victim in eval mode; this does NOT disable grads.
+        self.attacked_model.eval()
+
+        # ---- helpers ---------------------------------------------------------
+        def _as_long_idx(idx_like):
+            if torch.is_tensor(idx_like):
+                return idx_like.to(self.device, dtype=torch.long)
+            return torch.as_tensor(idx_like, device=self.device, dtype=torch.long)
+
+        def _as_labels(y_like):
+            if torch.is_tensor(y_like):
+                return y_like.to(self.device, dtype=torch.long)
+            return torch.as_tensor(y_like, device=self.device, dtype=torch.long)
+
+        # Choose which nodes contribute to the loss
+        if subset == "attack":
+            idx = _as_long_idx(self.idx_attack)
+        elif subset == "all":
+            idx = torch.arange(self.n, device=self.device, dtype=torch.long)
+        else:
+            idx = _as_long_idx(subset)
+
+        # Handle empty selection gracefully
+        if idx.numel() == 0:
+            return torch.zeros(self.n, device=self.device)
+
+        # ---- data on the correct device/dtypes -------------------------------
+        x = self.attr.to(self.device).float()  # (N, F)
+
+        # IMPORTANT: use the *current* (possibly perturbed) adjacency if available
+        if hasattr(self, "get_modified_adj"):
+            ei, ew = self.get_modified_adj()
+            ei = ei.to(self.device)
+            ew = ew.to(self.device).float()
+        else:
+            ei = self.edge_index.to(self.device)
+            ew = (self.edge_weight.to(self.device).float()
+                  if getattr(self, "edge_weight", None) is not None
+                  else torch.ones(ei.size(1), device=self.device))
+
+        y = _as_labels(self.labels)
+
+        # ---- compute logits with grad enabled -------------------------------
+        with torch.enable_grad():
+            # node gates (one scalar per node) to measure sensitivity
+            g = torch.zeros(self.n, device=self.device).requires_grad_(True)  # (N,)
+            x_gated = x * (1.0 + g.unsqueeze(1))  # broadcast to (N, F)
+
+            logits = self.attacked_model(data=x_gated, adj=(ei, ew))  # (N, C)
+
+            if loss_type == "tanhMargin":
+                # margin = logit_true - max_{k != true} logit_k ; we *minimize* margin
+                logits_sel = logits[idx]  # (M, C)
+                y_sel = y[idx]  # (M,)
+                true_logit = logits_sel.gather(1, y_sel.view(-1, 1)).squeeze(1)  # (M,)
+                masked = logits_sel.clone()
+                masked[torch.arange(masked.size(0), device=masked.device), y_sel] = -1e30
+                max_other = masked.max(dim=1).values
+                margin = true_logit - max_other
+                loss = torch.tanh(margin).mean().neg()  # -mean(tanh(margin))
+            else:
+                # default: cross-entropy over the chosen subset
+                loss = F.cross_entropy(logits[idx], y[idx])
+
+            # gradient of loss wrt node gates
+            (grad_g,) = torch.autograd.grad(loss, g, retain_graph=False, create_graph=False)
+
+        saliency = grad_g.abs().detach()  # (N,)
+        return saliency
+
+    def _gumbel_topk(self, logits: torch.Tensor, k: int) -> torch.Tensor:
+        """
+        Gumbel-top-k without replacement on a 1D logits tensor.
+        Returns indices of the k sampled items (k clipped to len).
+        """
+        k = int(min(k, logits.numel()))
+        if k <= 0 or logits.numel() == 0:
+            return torch.empty(0, dtype=torch.long, device=logits.device)
+        # Add i.i.d. Gumbel noise: g = -log(-log(U))
+        g = -torch.log(-torch.log(torch.clamp(torch.rand_like(logits), 1e-12, 1. - 1e-12)))
+        return torch.topk(logits + g, k=k, largest=True).indices
+
+    import torch
+    import torch.nn.functional as F
+
+    def _dense_from_edge_index(self):
+        N = int(self.n)
+        A = torch.zeros((N, N), dtype=torch.float32, device=self.device)
+        ei = self.edge_index.to(self.device)
+        A[ei[0].long(), ei[1].long()] = 1.0
+        A[ei[1].long(), ei[0].long()] = 1.0
+        A.fill_diagonal_(0.0)
+        return A
+
+    def _normalize_dense(self, A):
+        N = A.size(0)
+        A_tilde = A + torch.eye(N, dtype=A.dtype, device=A.device)
+        deg = A_tilde.sum(dim=1)
+        deg_inv_sqrt = torch.pow(deg.clamp(min=1e-12), -0.5)
+        D = torch.diag(deg_inv_sqrt)
+        return D @ A_tilde @ D
+
+    def make_pgd_forward_from_victim(self):
+        # attach a function that maps (X, Abar_dense) -> logits via attacked_model
+        def fwd(X, Abar):
+            # convert dense normalized adjacency to sparse edge_index/edge_weight
+            idx = Abar.nonzero(as_tuple=False).t()  # (2, E)
+            w = Abar[idx[0], idx[1]]  # (E,)
+            return self.attacked_model(data=X, adj=(idx, w))
+
+        self.pgd_forward = fwd
+
+    def _pgd_node_labels(self, loss_nodes=None, loss_type="ce", kappa=0.0):
+        import torch
+        import torch.nn.functional as F
+
+        with torch.enable_grad():  # <-- ensure grad mode is ON
+            N = int(self.n)
+            X = self.attr.to(self.device).float()
+            y = torch.as_tensor(self.labels, device=self.device, dtype=torch.long)
+
+            if loss_nodes is None:
+                idx = (torch.as_tensor(self.idx_attack, device=self.device, dtype=torch.long)
+                       if getattr(self, "idx_attack", None) is not None
+                       else torch.arange(N, device=self.device, dtype=torch.long))
+            else:
+                idx = torch.as_tensor(loss_nodes, device=self.device, dtype=torch.long)
+
+            ei = self.edge_index.to(self.device)
+            ew = (self.edge_weight.to(self.device).float()
+                  if self.edge_weight is not None
+                  else torch.ones(ei.size(1), device=self.device))
+
+            g = torch.zeros(N, device=self.device, requires_grad=True)
+            Xg = X * (1.0 + g.unsqueeze(1))
+
+            logits = self.attacked_model(data=Xg, adj=(ei, ew))
+            # sanity checks (keep during debugging, then remove)
+            # assert logits.requires_grad, "attacked_model returned detached logits"
+            # assert torch.is_grad_enabled(), "Grad mode unexpectedly disabled here"
+
+            if loss_type == "ce":
+                loss = F.cross_entropy(logits[idx], y[idx])
+            else:
+                Z = logits[idx];
+                yy = y[idx]
+                true = Z[torch.arange(Z.size(0), device=Z.device), yy]
+                Zm = Z.clone();
+                Zm[torch.arange(Z.size(0), device=Z.device), yy] = -1e9
+                other = Zm.max(dim=1).values
+                margin = true - other
+                if kappa:
+                    margin = torch.maximum(margin, torch.tensor(-float(kappa), device=Z.device))
+                loss = -margin.mean()
+
+            (grad_g,) = torch.autograd.grad(loss, g, retain_graph=False, create_graph=False)
+            s = grad_g.abs()
+            return (s - s.mean()) / (s.std() + 1e-6)
+
+    def _pretrain_node_scorer_from_pgd(self, epochs=20, lr=1e-3, wd=5e-4,
+                                       loss_nodes=None, loss_type="ce", kappa=0.0, log_every=5):
+        """
+        Distill PGD-style node saliency into your NodeBlockScorer:
+          target: s_i (sum_j |dL/dA_ij|)
+          pred:   selector.node_head(selector.embed(...))
+        """
+        assert hasattr(self, "selector") and (self.selector is not None), \
+            "self.selector (NodeBlockScorer) is required."
+
+        self.selector.train()
+        X = self.attr.to(self.device).float()
+        ei = self.edge_index.to(self.device)
+        ew = (self.edge_weight.to(self.device).float() if getattr(self, "edge_weight", None) is not None else None)
+
+        # labels from PGD gradient
+        y_node = self._pgd_node_labels(loss_type=loss_type, kappa=kappa)  # (N,)
+
+        opt = torch.optim.Adam(self.selector.parameters(), lr=lr, weight_decay=wd)
+
+        for e in range(1, epochs + 1):
+            opt.zero_grad()
+            h = self.selector.embed(X, ei, ew)  # (N,d)
+            pred = self.selector.node_head(h).squeeze(-1)  # (N,)
+            loss = F.smooth_l1_loss(pred, y_node)
+            loss.backward()
+            opt.step()
+
+            if (e % max(1, log_every) == 0) or e in (1, epochs):
+                # you can swap to logging if you prefer
+                print(f"[PGD-NodePretrain] epoch {e}/{epochs}  loss={loss.item():.4f}")
+
+        self.selector.eval()
+        # flag for downstream checks
+        self._pgd_node_trained = True
+
+    def sample_block_from_pgdtopk(self,
+                                  k_nodes: int = 350,
+                                  prefer_edges: str = "intra",  # 'intra'|'incident'|'mix'
+                                  loss_nodes=None,
+                                  loss_type="ce",
+                                  kappa: float = 0.0,
+                                  pretrain_epochs: int = 20,
+                                  pretrain_lr: float = 1e-3,
+                                  pretrain_wd: float = 5e-4,
+                                  max_intra_ratio: float = 0.8):
+        """
+        1) Pretrains your node scorer on PGD-style node labels.
+        2) Extracts Top-K nodes by the trained scorer.
+        3) (Optional) Forms a PR-BCD block from those nodes.
+
+        Sets:
+          self.current_search_space (linear upper-tri idx)
+          self.modified_edge_index  (2, K) upper-tri edges
+          self.perturbed_edge_weight (K,)
+          self.topk_nodes (for inspection)
+        """
+        # --- (1) pretrain on PGD node labels ---
+        self._pretrain_node_scorer_from_pgd(
+            epochs=pretrain_epochs, lr=pretrain_lr, wd=pretrain_wd,
+            loss_nodes=loss_nodes, loss_type=loss_type, kappa=kappa
+        )
+
+        # --- (2) score nodes and select Top-K ---
+        X = self.attr.to(self.device).float()
+        ei = self.edge_index.to(self.device)
+        ew = (self.edge_weight.to(self.device).float() if getattr(self, "edge_weight", None) is not None else None)
+
+        with torch.no_grad():
+            h = self.selector.embed(X, ei, ew)
+            node_scores = self.selector.node_head(h).squeeze(-1)
+            # z-score (optional)
+            node_scores = (node_scores - node_scores.mean()) / (node_scores.std() + 1e-6)
+            k = int(min(max(2, k_nodes), self.n))
+            topk = torch.topk(node_scores, k=k, largest=True).indices.to(self.device)
+
+        self.topk_nodes = topk
+
+        # --- (3) build a block from Top-K nodes (upper-tri pairs) ---
+        import math
+        N = int(self.n)
+        # candidates within topk
+        if topk.numel() >= 2:
+            comb = torch.combinations(topk, r=2, with_replacement=False)  # (C(k,2), 2)
+            intra_u, intra_v = comb[:, 0], comb[:, 1]
+        else:
+            intra_u = intra_v = torch.empty(0, dtype=torch.long, device=self.device)
+
+        # incident candidates: connect topk to outside
+        all_idx = torch.arange(N, device=self.device)
+        is_top = torch.zeros(N, dtype=torch.bool, device=self.device);
+        is_top[topk] = True
+        outside = all_idx[~is_top]
+
+        # score edges by node scores (sum rule)
+        def score_pairs(U, V):
+            if U.numel() == 0:
+                return torch.empty(0, device=self.device)
+            return node_scores[U] + node_scores[V]
+
+        intra_scores = score_pairs(intra_u, intra_v)
+
+        # incident pool (rough sampling to keep it light)
+        target_block = int(self.block_size)
+        intra_quota = int(round(max_intra_ratio * target_block)) if prefer_edges in ("intra", "mix") else 0
+        remaining = max(0, target_block - intra_quota)
+
+        inc_u_list, inc_v_list, inc_s_list = [], [], []
+        if prefer_edges in ("incident", "mix") and outside.numel() > 0:
+            per_u = max(1, math.ceil(remaining / max(1, topk.numel())))
+            for u in topk:
+                # sample a small set of partners
+                if outside.numel() <= per_u:
+                    v = outside
+                else:
+                    sel = torch.randperm(outside.numel(), device=self.device)[:per_u]
+                    v = outside[sel]
+                if v.numel() == 0:
+                    continue
+                inc_u_list.append(u.repeat(v.numel()))
+                inc_v_list.append(v)
+                inc_s_list.append(score_pairs(u.repeat(v.numel()), v))
+        if len(inc_u_list) > 0:
+            inc_u = torch.cat(inc_u_list);
+            inc_v = torch.cat(inc_v_list);
+            inc_scores = torch.cat(inc_s_list)
+            # unique
+            lin = (torch.minimum(inc_u, inc_v) * N + torch.maximum(inc_u, inc_v))
+            uniq_lin, uniq_idx = torch.unique(lin, sorted=False, return_inverse=False, return_counts=False,
+                                              return_indices=True)
+            inc_u, inc_v, inc_scores = inc_u[uniq_idx], inc_v[uniq_idx], inc_scores[uniq_idx]
+        else:
+            inc_u = inc_v = torch.empty(0, dtype=torch.long, device=self.device)
+            inc_scores = torch.empty(0, device=self.device)
+
+        chosen_u, chosen_v = [], []
+
+        # take intra edges first
+        if intra_u.numel() > 0 and intra_quota > 0:
+            take = min(intra_quota, intra_u.numel())
+            top = torch.topk(intra_scores, k=take, largest=True).indices
+            chosen_u.append(intra_u[top]);
+            chosen_v.append(intra_v[top])
+
+        # then incident edges to fill the rest
+        need = target_block - (0 if len(chosen_u) == 0 else chosen_u[-1].numel())
+        if need > 0 and inc_u.numel() > 0:
+            take = min(need, inc_u.numel())
+            top = torch.topk(inc_scores, k=take, largest=True).indices
+            chosen_u.append(inc_u[top]);
+            chosen_v.append(inc_v[top])
+
+        if len(chosen_u) == 0:
+            # fallback: random upper-tri picks
+            tri_u, tri_v = torch.triu_indices(N, N, offset=1, device=self.device)
+            perm = torch.randperm(tri_u.numel(), device=self.device)[:target_block]
+            final_u, final_v = tri_u[perm], tri_v[perm]
+        else:
+            final_u = torch.cat(chosen_u);
+            final_v = torch.cat(chosen_v)
+            # pad if short
+            if final_u.numel() < target_block:
+                tri_u, tri_v = torch.triu_indices(N, N, offset=1, device=self.device)
+                rest = target_block - final_u.numel()
+                perm = torch.randperm(tri_u.numel(), device=self.device)[:rest]
+                final_u = torch.cat([final_u, tri_u[perm]])
+                final_v = torch.cat([final_v, tri_v[perm]])
+
+        # ensure upper-tri (i<j)
+        uu = torch.minimum(final_u, final_v)
+        vv = torch.maximum(final_u, final_v)
+        mask = uu < vv
+        uu, vv = uu[mask], vv[mask]
+
+        full_idx = torch.stack([uu, vv], dim=0)  # (2, K')
+
+        # convert to PRBCD's linear indexing
+        lin_idx = PRBCD.triu_idx_to_linear_idx(self.n, full_idx)
+
+        self.current_search_space = lin_idx
+        self.modified_edge_index = full_idx
+        self.perturbed_edge_weight = torch.full(
+            (self.current_search_space.numel(),),
+            self.eps, dtype=torch.float32, device=self.device, requires_grad=True
+        )
+
+    def sample_block_from_pgdtopk_direct(
+            self,
+            k_nodes: int = 350,
+            prefer_edges: str = "intra",  # 'intra' | 'incident' | 'mix'
+            loss_nodes=None,
+            loss_type: str = "ce",
+            kappa: float = 0.0,
+            max_intra_ratio: float = 0.8,
+    ):
+        """
+        Build PR-BCD block directly from a single PGD-style node saliency pass:
+          1) y_node = PGD node importance (N,)
+          2) topk = arg top-K y_node
+          3) candidate edges = intra(topk) plus incident(topk <-> outside) to fill block_size
+          4) finalize PR-BCD block tensors
+        """
+        import math
+        import torch
+
+        dev = self.device
+        N = int(self.n)
+
+        # --- (1) PGD node importances (teacher) ---
+
+        y_node = self._pgd_node_labels(loss_nodes=loss_nodes, loss_type=loss_type, kappa=kappa)  # (N,)
+            # z-score is already done in _pgd_node_labels; if you remove it there, uncomment:
+            # y_node = (y_node - y_node.mean()) / (y_node.std() + 1e-6)
+
+        # --- (2) pick Top-K nodes directly from y_node ---
+        k = int(min(max(2, k_nodes), N))
+        topk = torch.topk(y_node, k=k, largest=True).indices.to(dev)
+        self.topk_nodes = topk  # (for inspection)
+
+        # --- helper to convert (u,v) to upper-tri linear index ---
+        def pair_to_lin(u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+            uu = torch.minimum(u, v)
+            vv = torch.maximum(u, v)
+            mask = uu < vv
+            if mask.sum() == 0:
+                return torch.empty(0, dtype=torch.long, device=dev)
+            uu, vv = uu[mask], vv[mask]
+            full_idx = torch.stack([uu, vv], dim=0)
+            return PRBCD.triu_idx_to_linear_idx(N, full_idx)
+
+        # --- (3) candidate edges: intra-TopK and incident to outside ---
+        # Intra-TopK
+        if topk.numel() >= 2:
+            comb = torch.combinations(topk, r=2, with_replacement=False)  # (C(k,2), 2)
+            intra_u, intra_v = comb[:, 0], comb[:, 1]
+            intra_scores = y_node[intra_u] + y_node[intra_v]
+            intra_lin = pair_to_lin(intra_u, intra_v)
+        else:
+            intra_u = intra_v = torch.empty(0, dtype=torch.long, device=dev)
+            intra_scores = torch.empty(0, device=dev)
+            intra_lin = torch.empty(0, dtype=torch.long, device=dev)
+
+        # Incident: connect TopK to outside
+        all_idx = torch.arange(N, device=dev)
+        is_top = torch.zeros(N, dtype=torch.bool, device=dev)
+        is_top[topk] = True
+        outside = all_idx[~is_top]
+
+        incident_lin = torch.empty(0, dtype=torch.long, device=dev)
+        incident_scores = torch.empty(0, device=dev)
+        if outside.numel() > 0 and prefer_edges in ("incident", "mix"):
+            target_block = int(self.block_size)
+            intra_quota = int(round(max_intra_ratio * target_block)) if prefer_edges in ("intra", "mix") else 0
+            remaining = max(0, target_block - intra_quota)
+            per_u = max(1, math.ceil(remaining / max(1, topk.numel()))) if remaining > 0 else 0
+
+            inc_u_list, inc_v_list, inc_s_list = [], [], []
+            if per_u > 0:
+                for u in topk:
+                    if outside.numel() <= per_u:
+                        v = outside
+                    else:
+                        sel = torch.randperm(outside.numel(), device=dev)[:per_u]
+                        v = outside[sel]
+                    if v.numel() == 0:
+                        continue
+                    inc_u_list.append(u.repeat(v.numel()))
+                    inc_v_list.append(v)
+                    inc_s_list.append(y_node[u].repeat(v.numel()) + y_node[v])
+
+            if len(inc_u_list) > 0:
+                inc_u = torch.cat(inc_u_list);
+                inc_v = torch.cat(inc_v_list)
+                inc_scores = torch.cat(inc_s_list)
+                # unique within incident pool
+                uu = torch.minimum(inc_u, inc_v)
+                vv = torch.maximum(inc_u, inc_v)
+                lin = (uu * N + vv)
+                uniq_lin, uniq_idx = torch.unique(lin, sorted=False, return_inverse=False, return_counts=False,
+                                                  return_indices=True)
+                inc_u, inc_v, inc_scores = inc_u[uniq_idx], inc_v[uniq_idx], inc_scores[uniq_idx]
+                incident_scores = inc_scores
+                incident_lin = pair_to_lin(inc_u, inc_v)
+
+        # --- (4) assemble the block by scores ---
+        chosen = []
+        need_total = int(self.block_size)
+
+        # how much intra to take first
+        intra_quota = int(round(max_intra_ratio * need_total)) if prefer_edges in ("intra", "mix") else 0
+
+        if intra_lin.numel() > 0 and intra_quota > 0:
+            take = min(intra_quota, intra_lin.numel())
+            idx = torch.topk(intra_scores, k=take, largest=True).indices
+            chosen.append(intra_lin[idx])
+
+        taken = sum(x.numel() for x in chosen) if len(chosen) else 0
+        need = max(0, need_total - taken)
+
+        if need > 0 and incident_lin.numel() > 0:
+            take = min(need, incident_lin.numel())
+            idx = torch.topk(incident_scores, k=take, largest=True).indices
+            chosen.append(incident_lin[idx])
+            need -= take
+
+        # fallback: random upper-tri edges to pad
+        if need > 0:
+            n_possible = N * (N - 1) // 2
+            chosen.append(torch.randint(n_possible, (need,), device=dev, dtype=torch.long))
+
+        sel_lin = torch.unique(torch.cat(chosen), sorted=True) if len(chosen) else torch.empty(0, dtype=torch.long,
+                                                                                               device=dev)
+
+        # --- finalize PR-BCD tensors ---
+        self.current_search_space = sel_lin
+        self.modified_edge_index = PRBCD.linear_to_triu_idx(N, sel_lin)
+        self.perturbed_edge_weight = torch.full(
+            (sel_lin.numel(),), self.eps, dtype=torch.float32, device=dev, requires_grad=True
+        )
+
+        # (optional) warn if very small
+        if self.current_search_space.size(0) < need_total:
+            import logging
+            logging.warning("[PGD-TopK-Direct] Assembled %d < block_size=%d edges.",
+                            self.current_search_space.size(0), need_total)
+
+    def _selector_online_step(self):
+        # no-op / lazy init guards (keep yours if present)
+        if getattr(self, "selector", None) is None:
+            return
+        if getattr(self, "selector_opt", None) is None:
+            self.selector_opt = torch.optim.Adam(
+                self.selector.parameters(), lr=1e-3, weight_decay=5e-4
+            )
+
+        # teacher labels don't need grad
+        with torch.enable_grad():
+            y = self._make_margin_labels().to(self.device)
+
+        x = self.attr.to(self.device).float()
+        ei, ew = self.get_modified_adj()
+        ei = ei.to(self.device)
+        ew = ew.to(self.device).float()
+
+        # <-- turn grads back on just for the selector step
+        with torch.enable_grad():
+            self.selector.train()
+            self.selector_opt.zero_grad(set_to_none=True)
+
+            h = self.selector.embed(x, ei, ew)  # requires grad
+            pred = self.selector.node_head(h).squeeze(-1)  # requires grad
+            loss = F.smooth_l1_loss(pred, y.detach())
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.selector.parameters(), 5.0)
+            self.selector_opt.step()
+            self.selector.eval()
+
+    def _selector_online_step_pgd(self):
+        if getattr(self, "selector", None) is None:
+            return
+        if getattr(self, "selector_opt", None) is None:
+            self.selector_opt = torch.optim.Adam(self.selector.parameters(), lr=1e-3, weight_decay=5e-4)
+
+        # --- teacher: node vulnerability from a single PGD-style backward
+        # IMPORTANT: must be OUTSIDE no_grad, since it runs a backward() internally
+        with torch.enable_grad():
+            y = self._pgd_node_labels(loss_nodes=self.idx_attack, loss_type="ce").detach()  # (N,)
+
+        # --- data on current (attacked) graph
+        x = self.attr.to(self.device).float()
+        ei, ew = self.get_modified_adj()
+        ei = ei.to(self.device)
+        ew = ew.to(self.device).float()
+
+        # --- one training step for the selector
+        with torch.enable_grad():
+            self.selector.train()
+            self.selector_opt.zero_grad(set_to_none=True)
+            h = self.selector.embed(x, ei, ew)  # (N, d)
+            pred = self.selector.node_head(h).squeeze(-1)  # (N,)
+            loss = F.smooth_l1_loss(pred, y)  # teacher already z-scored
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.selector.parameters(), 5.0)
+            self.selector_opt.step()
+            self.selector.eval()
+
+    def sample_block_from_selector(
+            self,
+            n_perturbations: int = 0,
+            k_nodes: int = None,
+            prioritize_intra: bool = True,
+            # ----- new knobs (defaults preserve old behavior) -----
+            ensure_pretrain: bool = True,
+            pretrain_epochs: int = 20,
+            pretrain_lr: float = 1e-3,
+            pretrain_wd: float = 5e-4,
+            # blend control
+            alpha_saliency: float = 0.7,  # node_score = α·sal + (1-α)·pred
+            # what to use to SAMPLE edges (pure saliency vs blended score)
+            saliency_edges: bool = True,  # True => edge probs from saliency only
+            # Gumbel switches & temps
+            gumbel_nodes: bool = True,  # sample top-k nodes via Gumbel-softmax
+            gumbel_edges: bool = True,  # sample edges via Gumbel-softmax
+            tau_nodes: float = 1.0,  # temperature for node sampling
+            tau_edges: float = 1.0,  # temperature for edge sampling
+            # structure / quotas
+            max_intra_ratio: float = 0.1,  # quota for intra-topk edges
+            log_examples: int = 10,
+    ):
+        """
+        Build a PR-BCD block over ALL undirected pairs (i<j), using stochastic
+        Gumbel-Softmax sampling:
+          • Nodes: sample k via Gumbel-top-k over softmax(node_score / τ_nodes)
+          • Edges: sample via Gumbel-top-k over softmax(edge_score / τ_edges)
+
+        Edge scores can be taken from *pure saliency* (default) or the blended node score.
+        """
+        import math
+        import torch
+
+        dev, N = self.device, self.n
+
+        # 0) Availability Check
+        if ensure_pretrain and not getattr(self, "_margin_trained", False):
+            logging.info("[Selector] Pretraining NodeBlockScorer...")
+            self._pretrain_margin_scorer(epochs=pretrain_epochs, lr=pretrain_lr, wd=pretrain_wd)
+        else:
+            logging.info("[Selector] Using NodeBlockScorer (pretrained=%s).",
+                         getattr(self, "_margin_trained", False))
+
+
+        '''if ensure_pretrain and not getattr(self, "_pregnn_trained", False):
+            logging.info("[Selector] Pretraining encoder with LinkPred (PreGNN)...")
+            self._pretrain_pregnn_linkpred(
+                epochs=pretrain_epochs,
+                lr=pretrain_lr,
+                wd=pretrain_wd,
+                neg_per_pos=1,  # try 1–5
+                batch_size=65536,  # tune per memory
+                use_bilinear=True,  # dot is fine too
+                edge_dropout=0.1,  # 0.0–0.2 is common
+                temp=1.0,
+                log_every=max(1, pretrain_epochs // 5),
+                topk_pos_ratio=0.25,  # work on top 25% hardest positives
+                topk_pos_mode="loss",  # rank by BCE loss vs 1
+                hard_negatives=True,  # hardest negatives per batch
+                neg_oversample=4,  # 4x pool for hard-neg mining
+            )
+        else:
+            logging.info("[Selector] Using encoder (pregnn_trained=%s).", getattr(self, "_pregnn_trained", False))
+        '''
+
+        # 1) Saliency score arXiv:2201.13291v3
+        sal = self._node_saliency_from_victim(subset="attack").to(dev)
+        sal = (sal - sal.mean()) / (sal.std() + 1e-6)
+
+        self.selector.eval()
+        with torch.no_grad():
+            x = self.attr.to(dev).float()
+            ei = self.edge_index.to(dev)
+            ew = (self.edge_weight.to(dev).float()
+                  if self.edge_weight is not None
+                  else torch.ones(ei.size(1), device=dev))
+            h = self.selector.embed(x, ei, ew)
+            pred = self.selector.node_head(h).squeeze(-1)
+            pred = (pred - pred.mean()) / (pred.std() + 1e-6)
+
+        # 2) Blended node score for *ranking/probabilities*
+        alpha = float(alpha_saliency)
+        node_score = alpha * sal + (1.0 - alpha) * pred
+
+        # Helper: mapped (u,v) -> linear upper-tri index
+        def pair_to_lin(u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+            uu = torch.minimum(u, v)
+            vv = torch.maximum(u, v)
+            mask = (uu < vv)
+            if mask.sum() == 0:
+                return torch.empty(0, dtype=torch.long, device=dev)
+            uu, vv = uu[mask], vv[mask]
+            return PRBCD.triu_idx_to_linear_idx(N, torch.stack([uu, vv], dim=0))
+
+        # 4) Pick k nodes — either greedy top‑k or Gumbel‑top‑k over softmax(node_score/τ)
+        if k_nodes is None:
+            k_nodes = int(math.ceil((1.0 + math.sqrt(1.0 + 8.0 * self.block_size)) / 2.0))
+        k = int(min(k_nodes, N))
+
+        if gumbel_nodes:
+            node_logits = torch.log_softmax(node_score / max(1e-6, float(tau_nodes)), dim=0)
+            topk_nodes = PRBCD._gumbel_topk(self ,node_logits, k).to(dev)
+        else:
+            topk_nodes = torch.topk(node_score, k=k, largest=True).indices.to(dev)
+
+        if log_examples > 0:
+            logging.info("[Selector] k=%d | example top nodes: %s", k, topk_nodes[:log_examples].tolist())
+
+        # 5) Build intra-topk candidate edges + scores
+        if topk_nodes.numel() >= 2:
+            comb = torch.combinations(topk_nodes, r=2, with_replacement=False)  # (C(k,2), 2)
+            intra_u, intra_v = comb[:, 0], comb[:, 1]
+            intra_lin = pair_to_lin(intra_u, intra_v)
+        else:
+            intra_u = intra_v = torch.empty(0, dtype=torch.long, device=dev)
+            intra_lin = torch.empty(0, dtype=torch.long, device=dev)
+
+        # Edge scores: by default use *pure saliency* (requested), or blended
+        node_for_edges = sal if bool(saliency_edges) else node_score
+        intra_scores = (node_for_edges[intra_u] + node_for_edges[intra_v]) if intra_lin.numel() > 0 \
+            else torch.empty(0, device=dev)
+
+        # 6) Incident candidates (topk ↔ outside) — sample partners by node probabilities
+        all_idx = torch.arange(N, device=dev)
+        is_top = torch.zeros(N, dtype=torch.bool, device=dev)
+        is_top[topk_nodes] = True
+        outside = all_idx[~is_top]
+
+        incident_lin_list, incident_scores_list = [], []
+        need_total = int(self.block_size)
+        intra_quota = int(round(max_intra_ratio * need_total)) if prioritize_intra else 0
+        # aim to fill remaining with incident; split roughly across top nodes
+        remaining_need = max(0, need_total - (intra_lin.numel() if intra_quota > 0 else 0))
+        per_top_quota = max(1, math.ceil(remaining_need / max(1, topk_nodes.numel()))) if remaining_need > 0 else 0
+
+        if outside.numel() > 0 and per_top_quota > 0:
+            outside_logits = torch.log_softmax(node_for_edges[outside] / max(1e-6, float(tau_edges)), dim=0)
+            for u in topk_nodes:
+                if per_top_quota <= 0:
+                    break
+                # sample partners for u (with replacement) by Gumbel-top-k over outside logits
+                # (equivalent to drawing the highest Gumbel-perturbed log-probs)
+                v_sel = self._gumbel_topk(outside_logits, per_top_quota)
+                v = outside[v_sel]
+                u_rep = u.repeat(v.numel())
+                lin = pair_to_lin(u_rep, v)
+                if lin.numel() == 0:
+                    continue
+                incident_lin_list.append(lin)
+                incident_scores_list.append(node_for_edges[u_rep] + node_for_edges[v])
+
+        if len(incident_lin_list) > 0:
+            incident_lin = torch.cat(incident_lin_list, dim=0)
+            incident_scores = torch.cat(incident_scores_list, dim=0)
+            # unique within incident pool
+            uniq_lin, uniq_idx = torch.unique(incident_lin, sorted=False, return_inverse=False, return_counts=False,
+                                              return_indices=True)
+            incident_lin = uniq_lin
+            incident_scores = incident_scores[uniq_idx]
+        else:
+            incident_lin = torch.empty(0, dtype=torch.long, device=dev)
+            incident_scores = torch.empty(0, device=dev)
+
+        # 7) Assemble block: sample edges via Gumbel-top-k (or greedy if gumbel_edges=False)
+        def pick_edges(idx_lin: torch.Tensor, scores: torch.Tensor, m: int) -> torch.Tensor:
+            if idx_lin.numel() == 0 or m <= 0:
+                return torch.empty(0, dtype=torch.long, device=dev)
+            m = min(m, idx_lin.numel())
+            if gumbel_edges:
+                logits = torch.log_softmax(scores / max(1e-6, float(tau_edges)), dim=0)
+                sel = self._gumbel_topk(logits, m)
+            else:
+                sel = torch.topk(scores, k=m, largest=True).indices
+            return idx_lin[sel]
+
+        chosen, need = [], need_total
+
+        if prioritize_intra and intra_lin.numel() > 0:
+            take_intra = pick_edges(intra_lin, intra_scores, min(intra_quota, need))
+            chosen.append(take_intra)
+            need -= take_intra.numel()
+
+        if need > 0 and incident_lin.numel() > 0:
+            take_inc = pick_edges(incident_lin, incident_scores, need)
+            chosen.append(take_inc)
+            need -= take_inc.numel()
+
+        # fallback: random from the whole upper-tri space to keep exploration
+        if need > 0:
+            n_possible = N * (N - 1) // 2
+            chosen.append(torch.randint(n_possible, (need,), device=dev, dtype=torch.long))
+            need = 0
+
+        sel_lin = torch.unique(torch.cat(chosen), sorted=True) if len(chosen) else torch.empty(0, dtype=torch.long,
+                                                                                               device=dev)
+        if sel_lin.numel() < self.block_size:
+            logging.warning("[Selector] Only %d candidates assembled (requested %d).", sel_lin.numel(), self.block_size)
+
+        # 8) Finalize PR-BCD block tensors
+        self.current_search_space = sel_lin
+        self.modified_edge_index = PRBCD.linear_to_triu_idx(N, sel_lin)
+        self.perturbed_edge_weight = torch.full((sel_lin.numel(),), self.eps, dtype=torch.float32, device=dev,
+                                                requires_grad=True)
+
+        # Budget sanity
+        if self.current_search_space.size(0) < n_perturbations:
+            logging.warning("[Selector] Block smaller than n_perturbations: %d < %d.",
+                            self.current_search_space.size(0), n_perturbations)
+
+    def _current_node_scores(self, blend_alpha: float = 0.0) -> torch.Tensor:
+        """
+        Compute node scores used for guided sampling.
+        blend_alpha=0 -> pure selector prediction (fast);
+        blend_alpha>0 -> blend with saliency for stability: alpha*sal + (1-alpha)*pred
+        """
+        x = self.attr.to(self.device).float()
+        ei, ew = self.get_modified_adj()
+        ei = ei.to(self.device)
+        ew = ew.to(self.device).float()
+
+        with torch.no_grad():
+            h = self.selector.embed(x, ei, ew)
+            pred = self.selector.node_head(h).squeeze(-1)
+            pred = (pred - pred.mean()) / (pred.std() + 1e-6)
+
+        if blend_alpha <= 1e-9:
+            return pred
+
+        with torch.enable_grad():
+            sal = self._node_saliency_from_victim(subset="attack").to(self.device)
+            sal = (sal - sal.mean()) / (sal.std() + 1e-6)
+        return float(blend_alpha) * sal + (1.0 - float(blend_alpha)) * pred
+
+    def _assemble_edges_from_nodes(
+            self,
+            node_scores: torch.Tensor,
+            need: int,
+            prefer: str = "mix",
+            max_intra_ratio: float = 0.5,
+    ) -> torch.Tensor:
+        """
+        Build up to `need` new upper-tri *linear* edge indices guided by node_scores.
+        prefer: 'intra' | 'incident' | 'mix'
+        """
+        import math
+        dev = self.device
+        N = int(self.n)
+
+        # ---- choose k so C(k,2) isn't trivially < need ----
+        k_nodes = int(min(N, max(2, math.ceil(0.5 * (1 + math.sqrt(1 + 8 * need))))))  # ~inverse of C(k,2)
+        topk = torch.topk(node_scores, k=k_nodes, largest=True).indices.to(dev)
+
+        # ---- intra-topk candidates ----
+        if topk.numel() >= 2:
+            comb = torch.combinations(topk, r=2, with_replacement=False)  # (C(k,2), 2)
+            intra_u, intra_v = comb[:, 0], comb[:, 1]
+            uu = torch.minimum(intra_u, intra_v)
+            vv = torch.maximum(intra_u, intra_v)
+            intra_lin = PRBCD.triu_idx_to_linear_idx(N, torch.stack([uu, vv], dim=0))
+            intra_scores = node_scores[intra_u] + node_scores[intra_v]
+        else:
+            intra_lin = torch.empty(0, dtype=torch.long, device=dev)
+            intra_scores = torch.empty(0, device=dev)
+
+        # ---- incident candidates (topk ↔ outside) ----
+        all_idx = torch.arange(N, device=dev)
+        is_top = torch.zeros(N, dtype=torch.bool, device=dev)
+        is_top[topk] = True
+        outside = all_idx[~is_top]
+
+        inc_lin = torch.empty(0, dtype=torch.long, device=dev)
+        inc_scores = torch.empty(0, device=dev)
+
+        if outside.numel() > 0 and prefer in ("incident", "mix"):
+            per_u = max(1, math.ceil(need / max(1, topk.numel())))
+            us, vs, ss = [], [], []
+            for u in topk:
+                if outside.numel() <= per_u:
+                    v = outside
+                else:
+                    sel = torch.randperm(outside.numel(), device=dev)[:per_u]
+                    v = outside[sel]
+                if v.numel() == 0:
+                    continue
+                uu = torch.minimum(u.repeat(v.numel()), v)
+                vv = torch.maximum(u.repeat(v.numel()), v)
+                us.append(uu);
+                vs.append(vv)
+                ss.append(node_scores[u].repeat(v.numel()) + node_scores[v])
+
+            if len(us) > 0:
+                uu = torch.cat(us);
+                vv = torch.cat(vs);
+                ss = torch.cat(ss)
+
+                # ---- dedupe (uu,vv): use sort+mask (works on all PyTorch) ----
+                lin_raw = uu * N + vv  # linearize pairs (upper-tri since uu<=vv)
+                lin_sorted, perm = torch.sort(lin_raw)  # sort to detect dups
+                keep = torch.ones_like(lin_sorted, dtype=torch.bool, device=dev)
+                keep[1:] = lin_sorted[1:] != lin_sorted[:-1]
+                uniq_idx = perm[keep]  # indices into uu/vv/ss to keep
+
+                uu = uu[uniq_idx];
+                vv = vv[uniq_idx];
+                ss = ss[uniq_idx]
+                inc_lin = PRBCD.triu_idx_to_linear_idx(N, torch.stack([uu, vv], dim=0))
+                inc_scores = ss
+
+        # ---- assemble by quota ----
+        chosen = []
+        quota_intra = int(round(max_intra_ratio * need)) if prefer in ("intra", "mix") else 0
+
+        if intra_lin.numel() > 0 and quota_intra > 0:
+            take = min(quota_intra, intra_lin.numel())
+            idx = torch.topk(intra_scores, k=take, largest=True).indices
+            chosen.append(intra_lin[idx])
+
+        taken = sum(x.numel() for x in chosen) if chosen else 0
+        need_rest = max(0, need - taken)
+
+        if need_rest > 0 and inc_lin.numel() > 0:
+            take = min(need_rest, inc_lin.numel())
+            idx = torch.topk(inc_scores, k=take, largest=True).indices
+            chosen.append(inc_lin[idx])
+            need_rest -= take
+
+        if need_rest > 0:
+            # pad with random upper-tri edges
+            n_possible = N * (N - 1) // 2
+            chosen.append(torch.randint(n_possible, (need_rest,), device=dev, dtype=torch.long))
+
+        # final linear indices (unique to be safe against intra∩incident overlap)
+        return torch.unique(torch.cat(chosen), sorted=True) if chosen else torch.empty(0, dtype=torch.long, device=dev)
+
+    def resample_block_from_selector(
+            self,
+            n_perturbations: int,
+            blend_alpha: float = 1.0,  # <-- default to using saliency (α=1.0)
+            prefer_edges: str = "mix",
+            max_intra_ratio: float = 0.5,
+    ):
+        """
+        Guided resampling using PGD node saliency as the teacher for the selector.
+        """
+        if self.keep_heuristic != "WeightOnly":
+            raise NotImplementedError("Only keep_heuristic=`WeightOnly` supported")
+
+        # --- keep phase (same as before) ---
+        sorted_idx = torch.argsort(self.perturbed_edge_weight)  # ascending
+        idx_keep = (self.perturbed_edge_weight <= self.eps).sum().long()
+        if idx_keep < sorted_idx.size(0) // 2:
+            idx_keep = sorted_idx.size(0) // 2
+        keep_idx = sorted_idx[idx_keep:]
+
+        kept_lin = self.current_search_space[keep_idx].to(self.device)
+        kept_w = self.perturbed_edge_weight[keep_idx].to(self.device)
+        kept_pairs = PRBCD.linear_to_triu_idx(self.n, kept_lin) if self.make_undirected \
+            else PRBCD.linear_to_full_idx(self.n, kept_lin)
+
+        # --- selector update (PGD teacher) ---
+        self._selector_online_step_pgd()
+
+        # --- refill guided by (α·saliency + (1−α)·selector) node scores ---
+        need = int(self.block_size) - int(kept_lin.numel())
+        if need <= 0:
+            self.current_search_space = kept_lin
+            self.modified_edge_index = kept_pairs
+            self.perturbed_edge_weight = kept_w
+            return
+
+
+        node_scores = self._current_node_scores(blend_alpha=blend_alpha)  # α>0 uses saliency
+        add_lin = self._assemble_edges_from_nodes(
+            node_scores, need, prefer=prefer_edges, max_intra_ratio=max_intra_ratio
+        )
+        with torch.no_grad():
+            if add_lin.numel() > 0:
+                merged = torch.cat([kept_lin, add_lin.to(self.device)], dim=0)
+                all_lin, inv = torch.unique(merged, sorted=True, return_inverse=True)
+                pos_kept = inv[: kept_lin.numel()]
+            else:
+                all_lin = kept_lin
+                pos_kept = torch.arange(kept_lin.numel(), device=self.device, dtype=torch.long)
+
+            self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, all_lin) if self.make_undirected \
+                else PRBCD.linear_to_full_idx(self.n, all_lin)
+
+            new_w = torch.full((all_lin.numel(),), self.eps, dtype=torch.float32, device=self.device)
+            new_w[pos_kept] = kept_w
+            self.perturbed_edge_weight = new_w
+            self.current_search_space = all_lin
+
+            if not self.make_undirected:
+                is_not_self = self.modified_edge_index[0] != self.modified_edge_index[1]
+                self.current_search_space = self.current_search_space[is_not_self]
+                self.modified_edge_index = self.modified_edge_index[:, is_not_self]
+                self.perturbed_edge_weight = self.perturbed_edge_weight[is_not_self]
+
+        if self.current_search_space.size(0) <= n_perturbations:
+            logging.warning("[SelectorResample] Block size %d ≤ n_perturbations %d; consider increasing block_size.",
+                            self.current_search_space.size(0), n_perturbations)
+
     def resample_random_block(self, n_perturbations: int): #TODO: still work to be done
         if self.keep_heuristic == 'WeightOnly':
             sorted_idx = torch.argsort(self.perturbed_edge_weight)
@@ -610,6 +1677,329 @@ class PRBCD(SparseAttack):
             if self.current_search_space.size(0) > n_perturbations:
                 return
         raise RuntimeError('Sampling random block was not successfull. Please decrease `n_perturbations`.')
+
+    def resample_block_from_prior_gumbel(self, n_perturbations: int, tau: float = 1.0):
+        """
+        Keep at most half of the current block (largest weights),
+        then refill from the selector prior via Gumbel-Softmax + masking.
+        """
+        # --- keep heuristic (same semantics as your resample_random_block) ---
+        if self.keep_heuristic != 'WeightOnly':
+            raise NotImplementedError('Only keep_heuristic=`WeightOnly` supported')
+
+        sorted_idx = torch.argsort(self.perturbed_edge_weight)  # ascending
+        idx_keep = (self.perturbed_edge_weight <= self.eps).sum().long()
+        if idx_keep < sorted_idx.size(0) // 2:
+            idx_keep = sorted_idx.size(0) // 2
+        keep_idx = sorted_idx[idx_keep:]  # keep largest half
+
+        # slice current block
+        self.current_search_space = self.current_search_space[keep_idx]
+        self.modified_edge_index = self.modified_edge_index[:, keep_idx]
+        self.perturbed_edge_weight = self.perturbed_edge_weight[keep_idx]
+
+        # --- refill from prior ---
+        need = self.block_size - self.current_search_space.numel()
+        if need <= 0:
+            # nothing to refill
+            self._selector_log_probs = None
+            return
+
+        # sample_block_from_prior_gumbel / resample_block_from_prior_gumbel
+
+        logits = self.pre_gnn_prior(self.attr, self.edge_index, self.edge_weight)  # (E,)
+        logits = logits.to(self.device).float()  # <- ensure float dtype
+
+        # mask already-selected global edges
+        mask = torch.zeros_like(logits)
+        mask[self.current_search_space] = float('-inf')
+
+        picked, logps = [], []
+        for _ in range(need):
+            y = F.gumbel_softmax(logits + mask, tau=tau, hard=True, dim=0)  # (E,)
+            j = int(y.argmax())
+            picked.append(j)
+
+            logp = F.log_softmax(logits + mask, dim=0)[j]
+            logps.append(logp)
+
+            mask[j] = float('-inf')
+
+        add = torch.tensor(picked, device=self.device, dtype=torch.long)
+
+        # extend the block; no duplicates because of mask
+        self.current_search_space = torch.cat([self.current_search_space, add], dim=0)
+        self.modified_edge_index = self.edge_index[:, self.current_search_space]
+        self.perturbed_edge_weight = torch.cat([
+            self.perturbed_edge_weight,
+            torch.full((add.numel(),), self.eps, dtype=torch.float32, device=self.device)
+        ], dim=0)
+
+        # store log-probs for PG update
+        self._selector_log_probs = torch.stack(logps)
+
+    def _make_margin_labels(self):
+        """
+        Teacher labels from the victim: margin_i = top1_logit - top2_logit (clean graph).
+        Returns z-scored margins (N,).
+        """
+        with torch.no_grad():
+            x = self.attr.to(self.device)
+            ei = self.edge_index.to(self.device)
+            # fall back to ones if edge_weight is None
+            if self.edge_weight is None:
+                ew = torch.ones(ei.size(1), device=self.device)
+            else:
+                ew = self.edge_weight.to(self.device)
+
+            logits = self.attacked_model(data=x, adj=(ei, ew))  # <-- victim
+            top2 = torch.topk(logits, k=2, dim=1).values  # (N, 2)
+            margins = (top2[:, 0] - top2[:, 1]).clamp_min(0.0)  # (N,)
+            return (margins - margins.mean()) / (margins.std() + 1e-6)
+
+    def _pretrain_margin_scorer(self, epochs: int = 20, lr: float = 1e-3, wd: float = 5e-4):
+        logging.info(f"[Selector] Pretraining NodeBlockScorer for {epochs} epochs "
+                     f"(lr={lr}, wd={wd}, device={self.device}).")
+        self.selector.train()
+        y = self._make_margin_labels().to(self.device)  # (N,)
+
+        x = self.attr.to(self.device)
+        ei = self.edge_index.to(self.device)
+        ew = self.edge_weight.to(self.device) if self.edge_weight is not None else None
+
+        opt = torch.optim.Adam(self.selector.parameters(), lr=lr, weight_decay=wd)
+        with torch.enable_grad():
+            for e in range(epochs):
+                opt.zero_grad()
+                h = self.selector.embed(x, ei, ew)  # (N,d)
+                pred = self.selector.node_head(h).squeeze(-1)  # (N,)
+                loss = F.smooth_l1_loss(pred, y)
+                loss.backward()
+                opt.step()
+
+                # log a few times during training
+                if (e + 1) % max(1, epochs // 5) == 0 or e == 0 or (e + 1) == epochs:
+                    logging.info(f"[Selector] pretrain epoch {e + 1}/{epochs} - loss={loss.item():.4f}")
+
+        self.selector.eval()
+        self._margin_trained = True
+        logging.info("[Selector] Pretraining finished.")
+
+    def _pretrain_pregnn_linkpred(
+            self,
+            epochs: int = 20,
+            lr: float = 1e-3,
+            wd: float = 5e-4,
+            neg_per_pos: int = 1,
+            batch_size: int = 65536,
+            use_bilinear: bool = True,
+            edge_dropout: float = 0.1,
+            temp: float = 1.0,
+            log_every: int = 5,
+            # ---- NEW knobs for Top-K sampling ----
+            topk_pos_ratio: float | None = None,  # e.g., 0.25 -> keep top 25% positives
+            topk_pos_mode: str = "loss",  # {"loss","score"} ranking criterion
+            hard_negatives: bool = True,  # do hard negative mining
+            neg_oversample: int = 4,  # oversample pool for hard negs
+    ):
+        """
+        Pretrain the GNN encoder via link prediction, with optional Top-K edge sampling.
+
+        Top-K positives:
+            - If topk_pos_ratio is not None, compute scores (or per-edge loss)
+              for *all* positives this epoch and keep only the Top-K fraction.
+
+        Hard negatives:
+            - If hard_negatives is True, for each batch oversample K*neg_oversample
+              random non-edges, score them, and keep only the highest-scoring K.
+
+        Loss: BCEWithLogits(pos=1, neg=0)
+        """
+        import math
+        import torch
+        import logging
+        from torch import nn
+        from torch.nn import functional as F
+
+        device = self.device
+        self.selector.train()
+
+        # --- Data on device ---
+        x = self.attr.to(device).float()
+        ei = self.edge_index.to(device)  # (2, E)
+        ew = (self.edge_weight.to(device).float()
+              if self.edge_weight is not None else None)
+
+        N = int(self.n)
+        E = int(ei.size(1))
+
+        # --- Undirected unique positives (u<v) ---
+        u = torch.minimum(ei[0], ei[1])
+        v = torch.maximum(ei[0], ei[1])
+        mask = (u != v)
+        u, v = u[mask], v[mask]
+        pos_uv = torch.unique(torch.stack([u, v], dim=0), dim=1)  # (2, Epos)
+        Epos = pos_uv.size(1)
+
+        # --- Membership set for negatives ---
+        pos_keys = (pos_uv[0].long() * N + pos_uv[1].long()).tolist()
+        pos_set = set(pos_keys)
+
+        # --- Optional bilinear scorer ---
+        bilinear = None
+        if use_bilinear:
+            bilinear = None  # lazy-init after we see embedding dim
+
+        def score_pairs(h, a, b):
+            nonlocal bilinear
+            if use_bilinear:
+                if bilinear is None:
+                    d = h.size(-1)
+                    bilinear = nn.Parameter(torch.empty(d, d, device=device))
+                    nn.init.xavier_uniform_(bilinear)
+                    self.selector.register_parameter("pregnn_bilinear_W", bilinear)
+                return (h[a] @ bilinear @ h[b].T).diag()
+            else:
+                return (h[a] * h[b]).sum(dim=-1)
+
+        def sample_negatives(num_neg: int):
+            out_u, out_v = [], []
+            needed, tries, max_tries = num_neg, 0, 10
+            while needed > 0 and tries < max_tries:
+                a = torch.randint(0, N, (needed * 2,), device=device)
+                b = torch.randint(0, N, (needed * 2,), device=device)
+                valid = (a != b)
+                a, b = a[valid], b[valid]
+                if a.numel() == 0:
+                    tries += 1
+                    continue
+                uu = torch.minimum(a, b)
+                vv = torch.maximum(a, b)
+                keys = (uu.long() * N + vv.long()).tolist()
+                keep = [k not in pos_set for k in keys]
+                keep = torch.tensor(keep, device=device, dtype=torch.bool)
+                uu, vv = uu[keep], vv[keep]
+                if uu.numel() == 0:
+                    tries += 1
+                    continue
+                take = min(needed, uu.numel())
+                out_u.append(uu[:take])
+                out_v.append(vv[:take])
+                needed -= take
+            if len(out_u) == 0:
+                uu = torch.arange(0, num_neg, device=device) % (N - 1)
+                vv = (uu + 1) % N
+                return uu, vv
+            return torch.cat(out_u), torch.cat(out_v)
+
+        # --- Optimizer ---
+        params = list(self.selector.parameters())
+        opt = torch.optim.Adam(params, lr=lr, weight_decay=wd)
+
+        bce = torch.nn.BCEWithLogitsLoss()
+        logging.info(
+            f"[PreGNN] LinkPred pretrain: epochs={epochs}, lr={lr}, wd={wd}, "
+            f"neg_per_pos={neg_per_pos}, batch_size={batch_size}, edge_dropout={edge_dropout}, "
+            f"topk_pos_ratio={topk_pos_ratio}, topk_pos_mode={topk_pos_mode}, "
+            f"hard_negatives={hard_negatives}, neg_oversample={neg_oversample}"
+        )
+
+        for ep in range(1, epochs + 1):
+            self.selector.train()
+
+            # DropEdge for robustness
+            if edge_dropout > 0.0 and E > 0:
+                keep_mask = torch.rand(E, device=device) > edge_dropout
+                ei_train = ei[:, keep_mask]
+                ew_train = (ew[keep_mask] if ew is not None else None)
+            else:
+                ei_train, ew_train = ei, ew
+
+            # Full-batch embeddings (one forward per epoch)
+            h = self.selector.embed(x, ei_train, ew_train)  # (N, d)
+
+            # ---- Top-K POSITIVES selection (optional) ----
+            pos_idx_pool = torch.arange(Epos, device=device)
+            if topk_pos_ratio is not None and 0.0 < topk_pos_ratio < 1.0:
+                pu_all = pos_uv[0, :]
+                pv_all = pos_uv[1, :]
+                s_pos_all = score_pairs(h, pu_all, pv_all)
+                if temp != 1.0:
+                    s_pos_all = s_pos_all / temp
+
+                if topk_pos_mode == "score":
+                    # keep the *highest-scoring* positive edges
+                    k_pos = max(1, int(math.ceil(Epos * topk_pos_ratio)))
+                    topk = torch.topk(s_pos_all, k=k_pos, largest=True).indices
+                    pos_idx_pool = topk
+                elif topk_pos_mode == "loss":
+                    # keep positives with highest BCE loss vs label=1 (hardest positives)
+                    # loss_pos = -log(sigmoid(s_pos))
+                    loss_pos = F.softplus(-s_pos_all)  # numerically stable
+                    k_pos = max(1, int(math.ceil(Epos * topk_pos_ratio)))
+                    topk = torch.topk(loss_pos, k=k_pos, largest=True).indices
+                    pos_idx_pool = topk
+                else:
+                    logging.warning(f"[PreGNN] Unknown topk_pos_mode={topk_pos_mode}; using full positives.")
+            else:
+                # shuffle all positives if not doing top-k
+                perm = torch.randperm(Epos, device=device)
+                pos_idx_pool = pos_idx_pool[perm]
+
+            # batching over selected positives
+            total_loss = 0.0
+            num_batches = int(math.ceil(pos_idx_pool.numel() / batch_size))
+
+            for b in range(num_batches):
+                start = b * batch_size
+                end = min(pos_idx_pool.numel(), (b + 1) * batch_size)
+                idx = pos_idx_pool[start:end]
+
+                pu = pos_uv[0, idx]
+                pv = pos_uv[1, idx]
+
+                # negatives needed for this mini-batch
+                need_neg = (end - start) * max(1, int(neg_per_pos))
+
+                if hard_negatives:
+                    # oversample a pool, then keep the Top-K hardest (highest score)
+                    nu_pool, nv_pool = sample_negatives(need_neg * max(1, int(neg_oversample)))
+                    s_neg_pool = score_pairs(h, nu_pool, nv_pool)
+                    if temp != 1.0:
+                        s_neg_pool = s_neg_pool / temp
+                    # Top hardest negatives
+                    keep_k = min(need_neg, s_neg_pool.numel())
+                    hard_idx = torch.topk(s_neg_pool, k=keep_k, largest=True).indices
+                    nu, nv = nu_pool[hard_idx], nv_pool[hard_idx]
+                else:
+                    nu, nv = sample_negatives(need_neg)
+
+                # compute scores
+                s_pos = score_pairs(h, pu, pv)
+                s_neg = score_pairs(h, nu, nv)
+                if temp != 1.0:
+                    s_pos = s_pos / temp
+                    s_neg = s_neg / temp
+
+                y_pos = torch.ones_like(s_pos)
+                y_neg = torch.zeros_like(s_neg)
+
+                loss = bce(s_pos, y_pos) + bce(s_neg, y_neg)
+
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.selector.parameters(), max_norm=5.0)
+                opt.step()
+
+                total_loss += loss.item()
+
+            if (ep % max(1, log_every) == 0) or ep == 1 or ep == epochs:
+                avg_loss = total_loss / max(1, num_batches)
+                logging.info(f"[PreGNN] epoch {ep}/{epochs} - linkpred loss={avg_loss:.4f}")
+
+        self.selector.eval()
+        self._pregnn_trained = True
+        logging.info("[PreGNN] Link prediction pretraining finished with Top-K sampling.")
 
     @staticmethod
     def linear_to_triu_idx(n: int, lin_idx: torch.Tensor) -> torch.Tensor:

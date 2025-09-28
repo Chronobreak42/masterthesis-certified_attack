@@ -124,7 +124,7 @@ def run(data_dir: str, dataset: str, attack: str, attack_params: Dict[str, Any],
     (
         attr, adj, labels, _, _, idx_test, storage, attack_params, pert_params, model_params, m
     ) = prepare_attack_experiment(
-        data_dir, dataset, attack, attack_params, epsilons, binary_attr, make_undirected,  seed, artifact_dir,
+        data_dir, dataset, attack, attack_params, epsilons, binary_attr, make_undirected, seed, artifact_dir,
         pert_adj_storage_type, pert_attr_storage_type, model_label, model_storage_type, device, surrogate_model_label,
         data_device, debug_level, ex
     )
@@ -134,22 +134,36 @@ def run(data_dir: str, dataset: str, attack: str, attack_params: Dict[str, Any],
 
     models_and_hyperparams = storage.find_models(model_storage_type, model_params)
 
+    # NEW: we'll keep the latest gradient and attack stats we observe
+    last_gradient = None
+    last_attack_stats = None  # dict of lists
+
     for model, hyperparams in models_and_hyperparams:
         model_label = hyperparams["label"]
         logging.info(f"Evaluate  {attack} for model '{model_label}'.")
-        adversary = create_attack(attack, attr=attr, adj=adj, labels=labels, model=model, idx_attack=idx_test,
-                                  device=device, data_device=data_device, binary_attr=binary_attr,
-                                  make_undirected=make_undirected, **attack_params)
+        adversary = create_attack(
+            attack, attr=attr, adj=adj, labels=labels, model=model, idx_attack=idx_test,
+            device=device, data_device=data_device, binary_attr=binary_attr,
+            make_undirected=make_undirected, **attack_params
+        )
 
         for epsilon in epsilons:
-            gradient = run_global_attack(epsilon, m, storage, pert_adj_storage_type, pert_attr_storage_type,
-                              pert_params, adversary, model_label, semi=semi, use_cert=use_cert, grid_radii=grid_radii, grid_binary_class=grid_binary_class)
+            # run the attack (may load from cache or actually optimize)
+            gradient = run_global_attack(
+                epsilon, m, storage, pert_adj_storage_type, pert_attr_storage_type,
+                pert_params, adversary, model_label, semi=semi, use_cert=use_cert,
+                grid_radii=grid_radii, grid_binary_class=grid_binary_class
+            )
+            last_gradient = gradient  # NEW: keep for return
 
+            # evaluate on the adversarial graph
             adj_adversary = adversary.adj_adversary
             attr_adversary = adversary.attr_adversary
 
-            logits, accuracy = Attack.evaluate_global(model.to(device), attr_adversary.to(device),
-                                                      adj_adversary.to(device), labels, idx_test)
+            logits, accuracy = Attack.evaluate_global(
+                model.to(device), attr_adversary.to(device),
+                adj_adversary.to(device), labels, idx_test
+            )
 
             results.append({
                 'label': model_label,
@@ -157,13 +171,22 @@ def run(data_dir: str, dataset: str, attack: str, attack_params: Dict[str, Any],
                 'accuracy': accuracy
             })
 
+            # NEW: capture per-epoch attack statistics for CSV logging
+            # adversary.attack_statistics is a defaultdict(list); cast to plain dict
+            if hasattr(adversary, "attack_statistics") and adversary.attack_statistics:
+                last_attack_stats = {k: list(v) for k, v in adversary.attack_statistics.items()}
+            else:
+                last_attack_stats = None  # nothing was recorded (e.g., loaded from cache)
+
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
 
     assert len(results) > 0
 
+    # NEW: include attack_statistics so your outer script can write the per-epoch CSV
     return {
         'results': results,
-        'gradient': gradient
+        'gradient': last_gradient,
+        'attack_statistics': last_attack_stats  # <-- your loop reads this
     }
