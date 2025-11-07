@@ -5,6 +5,8 @@ import math
 from typing import Tuple, Optional
 
 import pandas as pd
+from torch.nn import BCEWithLogitsLoss
+
 import AttackerGNN.PGDTopologyAttack as pgdtop
 from torch_geometric.nn import GCNConv
 from torch_geometric.utils import negative_sampling
@@ -17,6 +19,10 @@ from torch_sparse import SparseTensor
 #from AttackerGNN.PreEdgeSelector import PRBCDSelectorGNN
 from AttackerGNN.PriorSelector import PriorSelector
 from AttackerGNN.NodeBlockScorer import NodeBlockScorer
+import AttackerGNN.gnn_least_likely_edge as lle
+import AttackerGNN.gnn_score_all as sall
+from AttackerGNN.GCNLinkPredictor import GCNLinkPredictor
+from AttackerGNN.GCNMarginGradientPredictor import TinyGCN, tanh_margin_loss_label_free
 
 # from rgnn_at_scale.models import MODEL_TYPE
 from rgnn_at_scale.helper import utils
@@ -75,6 +81,11 @@ class PRBCD(SparseAttack):
         self.do_synchronize = do_synchronize
         self.max_final_samples = max_final_samples
 
+        self.intra_decay_mode = kwargs.get("intra_decay_mode", "exp")
+        self.intra_halflife_epochs = int(max(1, kwargs.get("intra_halflife_epochs", 5)))
+        self.initial_max_intra_ratio = 0.2  # start ratio
+        self.final_max_intra_ratio = 0.0  # end ratio after all resampling steps
+
         self.current_search_space: torch.Tensor = None
         self.current_node_search_space: torch.Tensor = None
         self.sample_space: torch.Tensor = None
@@ -100,7 +111,7 @@ class PRBCD(SparseAttack):
 
         self.lr_factor = lr_factor * max(math.log2(self.n_possible_edges / self.block_size), 1.)
 
-    def _attack(self, n_perturbations, semi=False, use_cert="none", grid_radii: Optional[np.ndarray] = None, grid_binary_class: Optional[np.ndarray] = None, **kwargs):
+    def _attack(self, graph, n_perturbations, semi=False, use_cert="none", grid_radii: Optional[np.ndarray] = None, grid_binary_class: Optional[np.ndarray] = None, **kwargs):
         """Perform attack (`n_perturbations` is increasing as it was a greedy attack).
 
         Parameters
@@ -137,6 +148,18 @@ class PRBCD(SparseAttack):
         elif use_cert in ("selector_block_pgd",):  # here is my selector
             print(use_cert, "-> using selector to build the initial block")
             self.sample_block_from_pgdtopk_direct()
+        elif use_cert in ("selector_block_linkpred",):
+            print(use_cert, "-> using selector link pred")
+            self.sample_block_from_linkpred_gnn(graph=graph,n_perturbations=n_perturbations)
+        elif use_cert in ("selector_block_linkpred_all",):
+            print(use_cert, "-> using selector link pred all")
+            self.sample_block_from_linkpred_gnn_all_pairs(graph=graph, b=50000)
+        elif use_cert in ("selector_block_linkpred_gcn",):
+            print(use_cert, "-> using selector link pred gcn")
+            self.sample_block_from_linkpred_gcn(graph=graph)
+        elif use_cert in ("selector_block_gradient_gcn",):
+            print(use_cert, "-> using selector gradient gcn")
+            self.sample_block_from_margin_loss_gcn(graph=graph)
         else:
             print(use_cert, "run sampling with no certificate")
             self.sample_random_block(n_perturbations)
@@ -235,13 +258,49 @@ class PRBCD(SparseAttack):
                         print(use_cert, "run resampling_with_prior")
                         self.resample_block_from_prior_gumbel(n_perturbations=n_perturbations, tau=1.0)
 
-                    elif use_cert in ("selector_block", "selector_block_pgd"):  # <— add this branch
-                        # guided: one selector step + refill by selector score
+
+                    elif use_cert in ("selector_block", "selector_block_pgd"):
+
+                        # --- Configurable decay mode ---
+                        # Choose between: "exp" | "linear" | "none"
+                        decay_mode = getattr(self, "intra_decay_mode", "exp")
+
+                        # Initial and final intra ratios (set these somewhere in __init__)
+                        init_ratio = float(self.initial_max_intra_ratio)
+                        final_ratio = float(getattr(self, "final_max_intra_ratio", 0.0))
+
+                        # --- Compute current intra ratio ---
+                        if decay_mode == "exp":
+                            # Exponential decay: halve every 10 epochs
+                            halving_steps = max(0, int(epoch // 10))
+                            current_max_intra = init_ratio * (0.5 ** halving_steps)
+
+                        elif decay_mode == "linear":
+                            # Linear decay over all resampling epochs
+                            total_resample_steps = max(1, getattr(self, "epochs_resampling", 1) - 1)
+                            resample_step = min(epoch, total_resample_steps)
+                            t = float(resample_step) / float(total_resample_steps)
+                            current_max_intra = init_ratio * (1.0 - t) + final_ratio * t
+
+                        elif decay_mode == "none":
+                            # No decay: keep constant
+                            current_max_intra = init_ratio
+
+                        else:
+                            raise ValueError(f"Unknown intra decay mode: {decay_mode}")
+
+                        # --- Clamp and log ---
+                        current_max_intra = max(final_ratio, min(1.0, current_max_intra))
+                        logging.info(
+                            f"[Resample] epoch={epoch} | mode={decay_mode} | max_intra_ratio={current_max_intra:.4f}"
+                        )
+
+                        # --- Perform resampling ---
                         self.resample_block_from_selector(
                             n_perturbations=n_perturbations,
-                            blend_alpha=0.5,  # 0 = pure pred; try 0.5 to blend saliency
-                            prefer_edges="mix",  # 'intra' | 'incident' | 'mix'
-                            max_intra_ratio=0.1
+                            blend_alpha=0,
+                            prefer_edges="intra",
+                            max_intra_ratio=current_max_intra,
                         )
                     else:
                         print(use_cert, "run resampling with no certificate")
@@ -338,21 +397,37 @@ class PRBCD(SparseAttack):
         return edge_index[:, edge_mask], edge_weight[edge_mask]
 
     def get_modified_adj(self):
+        # --- Fallback: no perturbations yet ---
+        if getattr(self, "perturbed_edge_weight", None) is None:
+            edge_index = self.edge_index.to(self.device)
+            edge_weight = (
+                self.edge_weight.to(self.device).float()
+                if getattr(self, "edge_weight", None) is not None
+                else torch.ones(edge_index.size(1), device=self.device)
+            )
+            return edge_index, edge_weight
+
+        # --- Original logic below ---
         if (
-            not self.perturbed_edge_weight.requires_grad
-            or not hasattr(self.attacked_model, 'do_checkpoint')
-            or not self.attacked_model.do_checkpoint
+                not self.perturbed_edge_weight.requires_grad
+                or not hasattr(self.attacked_model, 'do_checkpoint')
+                or not self.attacked_model.do_checkpoint
         ):
             if self.make_undirected:
                 modified_edge_index, modified_edge_weight = utils.to_symmetric(
                     self.modified_edge_index, self.perturbed_edge_weight, self.n
                 )
             else:
-                modified_edge_index, modified_edge_weight = self.modified_edge_index, self.perturbed_edge_weight
+                modified_edge_index, modified_edge_weight = (
+                    self.modified_edge_index,
+                    self.perturbed_edge_weight,
+                )
             edge_index = torch.cat((self.edge_index.to(self.device), modified_edge_index), dim=-1)
             edge_weight = torch.cat((self.edge_weight.to(self.device), modified_edge_weight))
 
-            edge_index, edge_weight = torch_sparse.coalesce(edge_index, edge_weight, m=self.n, n=self.n, op='sum')
+            edge_index, edge_weight = torch_sparse.coalesce(
+                edge_index, edge_weight, m=self.n, n=self.n, op='sum'
+            )
         else:
             # TODO: test with pytorch 1.9.0
             # Currently (1.6.0) PyTorch does not support return arguments of `checkpoint` that do not require gradient.
@@ -365,11 +440,16 @@ class PRBCD(SparseAttack):
                         self.modified_edge_index, perturbed_edge_weight, self.n
                     )
                 else:
-                    modified_edge_index, modified_edge_weight = self.modified_edge_index, self.perturbed_edge_weight
+                    modified_edge_index, modified_edge_weight = (
+                        self.modified_edge_index,
+                        self.perturbed_edge_weight,
+                    )
                 edge_index = torch.cat((self.edge_index.to(self.device), modified_edge_index), dim=-1)
                 edge_weight = torch.cat((self.edge_weight.to(self.device), modified_edge_weight))
 
-                edge_index, edge_weight = torch_sparse.coalesce(edge_index, edge_weight, m=self.n, n=self.n, op='sum')
+                edge_index, edge_weight = torch_sparse.coalesce(
+                    edge_index, edge_weight, m=self.n, n=self.n, op='sum'
+                )
                 return edge_index, edge_weight
 
             # Hack: for very large graphs the block needs to be added on CPU to save memory
@@ -387,7 +467,7 @@ class PRBCD(SparseAttack):
 
             edge_weight = checkpoint.checkpoint(
                 lambda *input: fuse_edges_run(*input)[1],
-                self.perturbed_edge_weight
+                self.perturbed_edge_weight,
             )
 
         # Allow removal of edges
@@ -681,7 +761,7 @@ class PRBCD(SparseAttack):
         import torch
         import torch.nn.functional as F
 
-        with torch.enable_grad():  # <-- ensure grad mode is ON
+        with torch.enable_grad():
             N = int(self.n)
             X = self.attr.to(self.device).float()
             y = torch.as_tensor(self.labels, device=self.device, dtype=torch.long)
@@ -693,18 +773,15 @@ class PRBCD(SparseAttack):
             else:
                 idx = torch.as_tensor(loss_nodes, device=self.device, dtype=torch.long)
 
-            ei = self.edge_index.to(self.device)
-            ew = (self.edge_weight.to(self.device).float()
-                  if self.edge_weight is not None
-                  else torch.ones(ei.size(1), device=self.device))
+            # >>> use *current* graph, not the clean one
+            ei, ew = self.get_modified_adj()
+            ei = ei.to(self.device)
+            ew = ew.to(self.device).float()
 
             g = torch.zeros(N, device=self.device, requires_grad=True)
             Xg = X * (1.0 + g.unsqueeze(1))
 
             logits = self.attacked_model(data=Xg, adj=(ei, ew))
-            # sanity checks (keep during debugging, then remove)
-            # assert logits.requires_grad, "attacked_model returned detached logits"
-            # assert torch.is_grad_enabled(), "Grad mode unexpectedly disabled here"
 
             if loss_type == "ce":
                 loss = F.cross_entropy(logits[idx], y[idx])
@@ -910,6 +987,487 @@ class PRBCD(SparseAttack):
             self.eps, dtype=torch.float32, device=self.device, requires_grad=True
         )
 
+    def sample_block_from_linkpred_gcn(self, graph):
+        import numpy as np
+        import torch
+        import torch.optim as optim
+        from torch.nn import BCEWithLogitsLoss
+        from torch_geometric.data import Data
+
+        device = getattr(self, "device", torch.device("cpu"))
+
+        # ---------- Build PyG Data from provided graph (SciPy -> torch) ----------
+        # Features (dense float32)
+        X_coo = graph.attr_matrix.tocoo()
+        X_idx = torch.tensor(np.vstack([X_coo.row, X_coo.col]), dtype=torch.long)
+        X_val = torch.tensor(X_coo.data, dtype=torch.float32)
+        X = torch.sparse_coo_tensor(X_idx, X_val, size=graph.attr_matrix.shape).coalesce().to_dense()
+
+        # Adjacency -> undirected edge_index (only once per undirected edge; upper-tri)
+        A_coo = graph.adj_matrix.tocoo()
+        ei_full = torch.tensor(np.vstack([A_coo.row, A_coo.col]), dtype=torch.long)
+        # keep (u<v) to get the undirected set without duplicates/self-loops
+        mask_upper = ei_full[0] < ei_full[1]
+        ei_upper = ei_full[:, mask_upper]  # (2, E_u)
+
+        # for message passing we want both directions of the TRAIN edges:
+        def make_bidir(ei):
+            return torch.cat([ei, ei.flip(0)], dim=1)  # (2, 2*E_subset)
+
+        data = Data(x=X, edge_index=None)  # will set train_ei later
+        data = data.to(device)
+        N = data.num_nodes
+        F = data.num_features
+
+        # ---------- Manual split on undirected edges ----------
+        E_u = ei_upper.size(1)
+        perm = torch.randperm(E_u)
+        # 5% val, 10% test (same as before)
+        n_val = max(1, int(0.05 * E_u))
+        n_test = max(1, int(0.10 * E_u))
+        n_train = E_u - n_val - n_test
+        idx_train = perm[:n_train]
+        idx_val = perm[n_train:n_train + n_val]
+        idx_test = perm[n_train + n_val:]
+
+        train_pos_u = ei_upper[:, idx_train]  # (2, Etr_u)
+        val_pos_u = ei_upper[:, idx_val]
+        test_pos_u = ei_upper[:, idx_test]
+
+        # Edge index used for message passing during training = bidirectional train edges
+        train_edge_index = make_bidir(train_pos_u).to(device)
+
+        # ---------- Model / opt ----------
+        model = GCNLinkPredictor(in_feats=F, hidden_feats=64, out_feats=32).to(device)
+        optimizer = optim.Adam(model.parameters(), lr=0.01)
+        loss_fn = BCEWithLogitsLoss()
+
+        # ---------- Train link predictor ----------
+        from torch_geometric.utils import negative_sampling
+        model.train()
+        rolling_sum, window = 0.0, 10
+
+        x = data.x.to(device)
+        for epoch in range(1, 201):
+            # negatives: same count as positive train edges (bidirectional count is double, so use undirected count)
+            neg_edge_index = negative_sampling(
+                edge_index=train_edge_index,
+                num_nodes=N,
+                num_neg_samples=train_pos_u.size(1) * 2  # match bidir positives
+            )
+
+            pos_edge_index = train_edge_index  # (2, 2*Etr_u)
+            combined_edge_index = torch.cat([pos_edge_index, neg_edge_index], dim=1)
+
+            pos_labels = torch.ones(pos_edge_index.size(1), device=device, dtype=torch.float32)
+            neg_labels = torch.zeros(neg_edge_index.size(1), device=device, dtype=torch.float32)
+            combined_labels = torch.cat([pos_labels, neg_labels], dim=0)
+
+            # shuffle
+            perm_edges = torch.randperm(combined_edge_index.size(1), device=device)
+            combined_edge_index = combined_edge_index[:, perm_edges]
+            combined_labels = combined_labels[perm_edges]
+
+            optimizer.zero_grad()
+            score_logits = model(x, pos_edge_index, combined_edge_index)
+            loss = loss_fn(score_logits.view_as(combined_labels), combined_labels)
+            loss.backward()
+            optimizer.step()
+
+            rolling_sum += loss.item()
+            if epoch % window == 0 or epoch == 1:
+                avg = rolling_sum / (window if epoch % window == 0 else 1)
+                print(f"Epoch {epoch:03d} | loss: {loss.item():.4f} | avg{window}: {avg:.4f}")
+                if epoch % window == 0:
+                    rolling_sum = 0.0
+
+        # ---------- Score ALL unordered pairs by entropy ----------
+        model.eval()
+        with torch.no_grad():
+            # all u<v pairs exactly once
+            all_pairs = torch.combinations(torch.arange(N, device=device), r=2)  # (M, 2)
+            all_edge_index = all_pairs.t().contiguous()  # (2, M)
+            edge_logits_all = model(x, train_edge_index, all_edge_index)  # (M,)
+            p = torch.sigmoid(edge_logits_all)
+            eps = 1e-12
+            edge_uncertainty_all = -(p * torch.log(p + eps) + (1 - p) * torch.log(1 - p + eps))  # (M,)
+
+        # ---------- Select top-K & store for PR-BCD ----------
+        K = min(50_000, all_edge_index.size(1))
+        topk_idx = torch.topk(edge_uncertainty_all, k=K, largest=True).indices
+
+        block_pairs = all_edge_index[:, topk_idx].detach().cpu()  # (2, K)
+        block_lin = PRBCD.triu_idx_to_linear_idx(N, block_pairs)  # (K,), CPU
+
+        # IMPORTANT: match PR-BCD expectations
+        self.current_search_space = block_lin.detach().to(device)  # (K,)
+        self.modified_edge_index = block_pairs.detach().to(device)  # (2, K)
+        self.perturbed_edge_weight = torch.full(
+            (block_lin.numel(),),
+            getattr(self, "eps", 1e-7),
+            dtype=torch.float32,
+            device=device,
+            requires_grad=True
+        )
+
+        print(f"Built ALL-PAIRS uncertainty block with {block_lin.numel()} edges.")
+
+    def sample_block_from_linkpred_gnn_all_pairs(self, graph, b):
+
+        # Suppose you already have: graph.attr_matrix (N x d, scipy COO/CSR) and graph.adj_matrix (N x N)
+        N, d = graph.attr_matrix.shape
+
+        # Convert attributes to torch sparse COO
+        X_coo = graph.attr_matrix.tocoo()
+        X_idx = torch.tensor(np.vstack([X_coo.row, X_coo.col]), dtype=torch.long)
+        X_val = torch.tensor(X_coo.data, dtype=torch.float32)
+        X_sparse = torch.sparse_coo_tensor(X_idx, X_val, size=(N, d)).coalesce()
+
+        # Convert adjacency to torch sparse COO (ensure symmetric for undirected graphs)
+        A_coo = graph.adj_matrix.tocoo()
+        A_idx = torch.tensor(np.vstack([A_coo.row, A_coo.col]), dtype=torch.long)
+        A_val = torch.tensor(A_coo.data, dtype=torch.float32)
+        A_sparse = torch.sparse_coo_tensor(A_idx, A_val, size=(N, N)).coalesce()
+
+        # Optional modified edges M as sparse COO (or set to None)
+
+        N, d = X_sparse.size()
+
+        model = sall.AllPairsLinkPredictor(in_dim=d, hidden=64, out_dim=64, dropout=0.1).to(X_sparse.device)
+        opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=5e-4)
+
+        # train a few epochs on ALL pairs
+        for ep in range(10):
+            opt.zero_grad(set_to_none=True)
+            loss = model.loss_all_pairs(X_sparse, A_sparse)
+            loss.backward()
+            opt.step()
+            print(f"epoch {ep + 1:02d} | loss {loss.item():.4f}")
+
+        # inference: top-20 pairs overall
+        model.eval()
+        pairs, probs = model.bottomk_pairs(X_sparse, A_sparse, k=b)
+        print("Top pairs:", pairs[:, :5].T.tolist(), "…")
+        print(pairs.shape)
+        print("Probs:", probs[:5].tolist(), "…")
+
+        # --- 4) Map to linear index space and trim/unique like sample_random_block ---
+        # edges_idx are already u < v (upper-triangle). Convert to linear upper-tri indices.
+        lin = self.pairs_to_linear_uppertri(pairs.to(self.device), N)  # (b_sel,)
+        # keep unique + sorted (should already be unique, but mirror random_block behavior)
+        lin = torch.unique(lin, sorted=True)
+
+        # Cap to self.block_size to honor the contract
+        if lin.numel() > self.block_size:
+            # because edges came sorted by ascending prob, keep front part
+            lin = lin[: self.block_size]
+
+        self.current_search_space = lin  # (m,)
+
+        # --- 5) Set modified_edge_index exactly like sample_random_block ---
+        if self.make_undirected:
+            self.modified_edge_index = PRBCD.linear_to_triu_idx(N, self.current_search_space)
+        else:
+            self.modified_edge_index = PRBCD.linear_to_full_idx(N, self.current_search_space)
+            # drop self-loops in the directed/full case
+            is_not_self_loop = self.modified_edge_index[0] != self.modified_edge_index[1]
+            if not torch.all(is_not_self_loop):
+                self.current_search_space = self.current_search_space[is_not_self_loop]
+                self.modified_edge_index = self.modified_edge_index[:, is_not_self_loop]
+
+        # --- 6) Initialize perturbed_edge_weight like sample_random_block ---
+        self.perturbed_edge_weight = torch.full(
+            (self.current_search_space.size(0),),
+            self.eps, dtype=torch.float32, device=self.device, requires_grad=True
+        )
+
+    def sample_block_from_margin_loss_gcn(self, graph, alpha_Sigmoid_APert=0):
+        import numpy as np
+        import torch
+
+        device = getattr(self, "device", torch.device("cpu"))
+
+        # ----- 1) Pull graph from argument (SciPy -> torch) -----
+        # X: (N, F)
+        X_coo = graph.attr_matrix.tocoo()
+        X_idx = torch.tensor(np.vstack([X_coo.row, X_coo.col]), dtype=torch.long, device=device)
+        X_val = torch.tensor(X_coo.data, dtype=torch.float32, device=device)
+        X_sparse = torch.sparse_coo_tensor(X_idx, X_val, size=graph.attr_matrix.shape, device=device).coalesce()
+        X = X_sparse.to_dense()
+
+        # A_base: (N, N) dense, symmetric, binary
+        A_coo = graph.adj_matrix.tocoo()
+        A_idx = torch.tensor(np.vstack([A_coo.row, A_coo.col]), dtype=torch.long, device=device)
+        A_val = torch.tensor(A_coo.data, dtype=torch.float32, device=device)
+        A_sparse = torch.sparse_coo_tensor(A_idx, A_val, size=graph.adj_matrix.shape, device=device).coalesce()
+        A_base = A_sparse.to_dense()
+        A_base = (A_base + A_base.t()).clamp(max=1.0)
+
+        N, F = X.shape
+
+        # classes (try to infer, else default)
+        if hasattr(graph, "labels") and graph.labels is not None:
+            num_classes = int(np.max(graph.labels)) + 1
+        else:
+            num_classes = 7  # safe default for Cora-like graphs
+
+        # ----- 2) Victim surrogate (TinyGCN) + label-free masked margin -----
+        gcn = TinyGCN(in_feats=F, hidden=64, out_feats=num_classes).to(device)
+        gcn.eval()
+
+        # ----- 3) Relaxed p over ALL undirected pairs (u < v) -----
+        iu, ju = torch.triu_indices(N, N, offset=1, device=device)  # all pairs once
+        M = iu.numel()
+
+        # sign: +1 insertion if no edge; -1 deletion if edge exists
+        is_existing = (A_base[iu, ju] > 0)
+        sign = torch.where(is_existing,
+                           torch.tensor(-1.0, device=device),
+                           torch.tensor(+1.0, device=device))  # (M,)
+
+        p = torch.zeros(M, device=device, requires_grad=True)
+
+        if alpha_Sigmoid_APert != 0:
+            # Smooth mapping from p → perturbation strength in [0, 1]
+            pert_strength = torch.sigmoid(alpha_Sigmoid_APert * p)  # (M,)
+
+            # Build symmetric perturbation matrix
+            Pmat = torch.zeros((N, N), device=device, dtype=torch.float32)
+            Pmat[iu, ju] = sign * pert_strength
+            Pmat[ju, iu] = sign * pert_strength
+        else:
+            Pmat = torch.zeros((N, N), device=device, dtype=torch.float32)
+            Pmat[iu, ju] = sign * p
+            Pmat[ju, iu] = sign * p
+
+        A_pert = A_base + Pmat
+
+        # ----- 4) Forward/backward to get |∂L'/∂p| -----
+        logits = gcn(X, A_pert)
+        loss = tanh_margin_loss_label_free(logits)
+        gcn.zero_grad(set_to_none=True)
+        loss.backward()  # populates p.grad
+
+        scores = p.grad.abs().detach()  # (M,)
+
+        # ----- 5) Top-K edges & store for PR-BCD -----
+        # use self.block_size if present, else cap at 50k
+        K_cap = 50_000
+        K = min(getattr(self, "block_size", K_cap), K_cap, M)
+        topk = torch.topk(scores, k=K, largest=True)
+        chosen = topk.indices  # indices into iu/ju
+
+        block_pairs = torch.stack([iu[chosen].cpu(), ju[chosen].cpu()], dim=0).contiguous()  # (2, K)
+        block_lin = PRBCD.triu_idx_to_linear_idx(N, block_pairs)  # (K,), CPU
+
+        self.current_search_space = block_lin.detach().to(device)  # (K,)
+        self.modified_edge_index = block_pairs.detach().to(device)  # (2, K)
+        self.perturbed_edge_weight = torch.full(
+            (block_lin.numel(),),
+            getattr(self, "eps", 1e-7),
+            dtype=torch.float32,
+            device=device,
+            requires_grad=True
+        )
+
+        print(f"Built p-grad block over ALL pairs with {block_lin.numel()} edges (top-{K} by |dL'/dp|).")
+        print(loss.item())
+
+    def sample_block_from_linkpred_gnn_old(self, graph, n_perturbations):
+        # Suppose you already have: graph.attr_matrix (N x d, scipy COO/CSR) and graph.adj_matrix (N x N)
+        N, d = graph.attr_matrix.shape
+
+        # Convert attributes to torch sparse COO
+        X_coo = graph.attr_matrix.tocoo()
+        X_idx = torch.tensor(np.vstack([X_coo.row, X_coo.col]), dtype=torch.long)
+        X_val = torch.tensor(X_coo.data, dtype=torch.float32)
+        X_sparse = torch.sparse_coo_tensor(X_idx, X_val, size=(N, d)).coalesce()
+
+        # Convert adjacency to torch sparse COO (ensure symmetric for undirected graphs)
+        A_coo = graph.adj_matrix.tocoo()
+        A_idx = torch.tensor(np.vstack([A_coo.row, A_coo.col]), dtype=torch.long)
+        A_val = torch.tensor(A_coo.data, dtype=torch.float32)
+        A_sparse = torch.sparse_coo_tensor(A_idx, A_val, size=(N, N)).coalesce()
+
+        # Optional modified edges M as sparse COO (or set to None)
+
+        N, d = X_sparse.size()
+        model = lle.GNNLeastLikelyEdges(in_dim=d, hidden=64, out_dim=64, dropout=0.1).to(X_sparse.device)
+        opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+
+        # Train with BCE (positives vs sampled non-edges)
+        for ep in range(1, 71):
+            model.train()
+            loss = model.bce_loss(X_sparse, A_sparse, M_sparse=None, neg_ratio=1, max_pos_per_batch=64000)
+            opt.zero_grad();
+            loss.backward();
+            opt.step()
+            if ep % 10 == 0 or ep == 1:
+                print(f"Epoch {ep:03d} | loss={float(loss):.6f}")
+
+            # --- 3) Inference: take least-likely existing edges ---
+        model.eval()
+        # default b: fill a block or use user-specified
+        want = self.block_size
+        edges_idx, edge_probs, _ = model(X_sparse, A_sparse, M_sparse=None, b=want)  # edges_idx: (2, b_sel) with u<v
+
+        # --- 4) Map to linear index space and trim/unique like sample_random_block ---
+        # edges_idx are already u < v (upper-triangle). Convert to linear upper-tri indices.
+        lin = self.pairs_to_linear_uppertri(edges_idx.to(self.device), N)  # (b_sel,)
+        # keep unique + sorted (should already be unique, but mirror random_block behavior)
+        lin = torch.unique(lin, sorted=True)
+
+        # Cap to self.block_size to honor the contract
+        if lin.numel() > self.block_size:
+            # because edges came sorted by ascending prob, keep front part
+            lin = lin[: self.block_size]
+
+        self.current_search_space = lin  # (m,)
+
+        # --- 5) Set modified_edge_index exactly like sample_random_block ---
+        if self.make_undirected:
+            self.modified_edge_index = PRBCD.linear_to_triu_idx(N, self.current_search_space)
+        else:
+            self.modified_edge_index = PRBCD.linear_to_full_idx(N, self.current_search_space)
+            # drop self-loops in the directed/full case
+            is_not_self_loop = self.modified_edge_index[0] != self.modified_edge_index[1]
+            if not torch.all(is_not_self_loop):
+                self.current_search_space = self.current_search_space[is_not_self_loop]
+                self.modified_edge_index = self.modified_edge_index[:, is_not_self_loop]
+
+        # --- 6) Initialize perturbed_edge_weight like sample_random_block ---
+        self.perturbed_edge_weight = torch.full(
+            (self.current_search_space.size(0),),
+            self.eps, dtype=torch.float32, device=self.device, requires_grad=True
+        )
+
+        # --- 7) Budget sanity (mirror sample_random_block) ---
+        if self.current_search_space.size(0) < n_perturbations:
+            raise RuntimeError(
+                f"GNN block smaller than n_perturbations: "
+                f"{self.current_search_space.size(0)} < {n_perturbations}. "
+                f"Try increasing b or lowering the budget."
+            )
+
+    def sample_block_from_linkpred_gnn(self, graph, n_perturbations):
+        import numpy as np
+        import torch
+        import torch.nn.functional as F
+
+        # --- 1) Convert inputs to torch sparse ---
+        N, d = graph.attr_matrix.shape
+
+        # X (features) -> sparse COO
+        X_coo = graph.attr_matrix.tocoo()
+        X_idx = torch.tensor(np.vstack([X_coo.row, X_coo.col]), dtype=torch.long, device=self.device)
+        X_val = torch.tensor(X_coo.data, dtype=torch.float32, device=self.device)
+        X_sparse = torch.sparse_coo_tensor(X_idx, X_val, size=(N, d), device=self.device).coalesce()
+
+        # A (adjacency) -> sparse COO (assume undirected input; if not, symmetrize outside)
+        A_coo = graph.adj_matrix.tocoo()
+        A_idx = torch.tensor(np.vstack([A_coo.row, A_coo.col]), dtype=torch.long, device=self.device)
+        A_val = torch.tensor(A_coo.data, dtype=torch.float32, device=self.device)
+        A_sparse = torch.sparse_coo_tensor(A_idx, A_val, size=(N, N), device=self.device).coalesce()
+
+        # --- 2) Build & train the LP GNN (same as before) ---
+        N, d = X_sparse.size()
+        model = lle.GNNLeastLikelyEdges(in_dim=d, hidden=64, out_dim=64, dropout=0.1).to(self.device)
+        opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+
+        for ep in range(1, 121):
+            model.train()
+            loss = model.bce_loss(X_sparse, A_sparse, M_sparse=None, neg_ratio=5, max_pos_per_batch=64000)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            if ep % 10 == 0 or ep == 1:
+                print(f"Epoch {ep:03d} | loss={float(loss):.6f}")
+
+        # --- 3) Inference: use HIGH-LP adds/removes initializer (new logic) ---
+        model.eval()
+        # total candidates you want in the block
+        B = self.block_size
+
+        # NOTE: init_block_highLP_add_remove must be added as a method on the model class (as discussed).
+        # It returns (u<v) pairs for both adds (non-edges) and removes (edges).
+        edges_idx, probs, is_add_mask = model.init_block_highLP_add_remove(
+            X_sparse, A_sparse, M_sparse=None,
+            B=B,
+            add_ratio=0.5,  # tune split
+            p_min=0.6,  # plausibility threshold
+            per_node_cap=8,  # diversity
+            rank_by="prob",  # or "prob"
+            dense_limit=7500,
+            block_size=50000
+        )  # edges_idx: (2, m), probs: (m,), is_add_mask: (m,)
+
+        # If init pool smaller than B, edges_idx may be shorter. That's fine; PRBCD just gets fewer candidates.
+
+        # --- 4) Map (u,v) to your linear upper-triangle indices (like random) ---
+        # edges_idx are already u < v (upper-triangle).
+        lin = self.pairs_to_linear_uppertri(edges_idx.to(self.device), N)  # (m,)
+
+        # Keep unique + sorted (mirrors random block behavior)
+        lin = torch.unique(lin, sorted=True)
+
+        # Cap to block_size (keep highest-priority first: since we sorted only by index, we reselect by probs if needed)
+        if lin.numel() > self.block_size:
+            # Re-rank the kept indices by their original priority (probs desc) before truncation:
+            # Build a map from linear -> score
+            with torch.no_grad():
+                # rebuild linear for original ordering
+                lin_all = self.pairs_to_linear_uppertri(edges_idx.to(self.device), N)
+                # sort by score (desc), then stable-filter to uniques
+                order = torch.argsort(probs.to(self.device), descending=True)
+                lin_ranked = lin_all[order]
+                # keep first occurrences up to block_size
+                seen = torch.zeros(lin.max().item() + 1, dtype=torch.bool, device=self.device)
+                sel = []
+                for i in range(lin_ranked.numel()):
+                    li = lin_ranked[i].item()
+                    if not seen[li]:
+                        sel.append(lin_ranked[i])
+                        seen[li] = True
+                        if len(sel) >= self.block_size:
+                            break
+                lin = torch.stack(sel) if sel else lin[: self.block_size]
+
+        self.current_search_space = lin  # (m,)
+
+        # --- 5) Set modified_edge_index like sample_random_block ---
+        if self.make_undirected:
+            self.modified_edge_index = PRBCD.linear_to_triu_idx(N, self.current_search_space)
+        else:
+            self.modified_edge_index = PRBCD.linear_to_full_idx(N, self.current_search_space)
+            is_not_self_loop = self.modified_edge_index[0] != self.modified_edge_index[1]
+            if not torch.all(is_not_self_loop):
+                self.current_search_space = self.current_search_space[is_not_self_loop]
+                self.modified_edge_index = self.modified_edge_index[:, is_not_self_loop]
+
+        # --- 6) Initialize perturbed_edge_weight like random ---
+        self.perturbed_edge_weight = torch.full(
+            (self.current_search_space.size(0),),
+            self.eps, dtype=torch.float32, device=self.device, requires_grad=True
+        )
+
+        # (Optional) If PRBCD needs to know add vs remove for each pair:
+        # You could store a boolean mask aligned to current_search_space.
+        # Build mask by recomputing linear indices for adds/removes separately and intersecting with lin.
+        # Example (cheap and safe even if we truncated/reordered above):
+        #   lin_all = self.pairs_to_linear_uppertri(edges_idx.to(self.device), N)
+        #   is_add_full = is_add_mask.to(self.device)
+        #   add_lin = lin_all[is_add_full]
+        #   is_add_flag = torch.isin(self.current_search_space, add_lin)
+        #   self.is_add_mask = is_add_flag  # save if your PRBCD uses it
+
+        # --- 7) Budget sanity ---
+        if self.current_search_space.size(0) < n_perturbations:
+            raise RuntimeError(
+                f"GNN block smaller than n_perturbations: "
+                f"{self.current_search_space.size(0)} < {n_perturbations}. "
+                f"Try increasing B or lowering the budget."
+            )
+
     def sample_block_from_pgdtopk_direct(
             self,
             k_nodes: int = 350,
@@ -917,7 +1475,7 @@ class PRBCD(SparseAttack):
             loss_nodes=None,
             loss_type: str = "ce",
             kappa: float = 0.0,
-            max_intra_ratio: float = 0.8,
+            max_intra_ratio: float = 0.1,
     ):
         """
         Build PR-BCD block directly from a single PGD-style node saliency pass:
@@ -995,15 +1553,21 @@ class PRBCD(SparseAttack):
                     inc_s_list.append(y_node[u].repeat(v.numel()) + y_node[v])
 
             if len(inc_u_list) > 0:
-                inc_u = torch.cat(inc_u_list);
+                inc_u = torch.cat(inc_u_list)
                 inc_v = torch.cat(inc_v_list)
                 inc_scores = torch.cat(inc_s_list)
-                # unique within incident pool
+
+                # unique within incident pool (upper-tri)
                 uu = torch.minimum(inc_u, inc_v)
                 vv = torch.maximum(inc_u, inc_v)
-                lin = (uu * N + vv)
-                uniq_lin, uniq_idx = torch.unique(lin, sorted=False, return_inverse=False, return_counts=False,
-                                                  return_indices=True)
+                lin = (uu * N + vv).to(torch.long)
+
+                # dedupe via sort + mask to get original indices
+                lin_sorted, perm = torch.sort(lin)
+                keep = torch.ones_like(lin_sorted, dtype=torch.bool, device=lin.device)
+                keep[1:] = lin_sorted[1:] != lin_sorted[:-1]
+                uniq_idx = perm[keep]
+
                 inc_u, inc_v, inc_scores = inc_u[uniq_idx], inc_v[uniq_idx], inc_scores[uniq_idx]
                 incident_scores = inc_scores
                 incident_lin = pair_to_lin(inc_u, inc_v)
@@ -1116,21 +1680,17 @@ class PRBCD(SparseAttack):
             n_perturbations: int = 0,
             k_nodes: int = None,
             prioritize_intra: bool = True,
-            # ----- new knobs (defaults preserve old behavior) -----
             ensure_pretrain: bool = True,
             pretrain_epochs: int = 20,
             pretrain_lr: float = 1e-3,
             pretrain_wd: float = 5e-4,
             # blend control
-            alpha_saliency: float = 0.7,  # node_score = α·sal + (1-α)·pred
-            # what to use to SAMPLE edges (pure saliency vs blended score)
+            alpha_saliency: float = 0.1,  # node_score = α·sal + (1-α)·pred
             saliency_edges: bool = True,  # True => edge probs from saliency only
-            # Gumbel switches & temps
             gumbel_nodes: bool = True,  # sample top-k nodes via Gumbel-softmax
             gumbel_edges: bool = True,  # sample edges via Gumbel-softmax
             tau_nodes: float = 1.0,  # temperature for node sampling
             tau_edges: float = 1.0,  # temperature for edge sampling
-            # structure / quotas
             max_intra_ratio: float = 0.1,  # quota for intra-topk edges
             log_examples: int = 10,
     ):
@@ -1155,29 +1715,6 @@ class PRBCD(SparseAttack):
             logging.info("[Selector] Using NodeBlockScorer (pretrained=%s).",
                          getattr(self, "_margin_trained", False))
 
-
-        '''if ensure_pretrain and not getattr(self, "_pregnn_trained", False):
-            logging.info("[Selector] Pretraining encoder with LinkPred (PreGNN)...")
-            self._pretrain_pregnn_linkpred(
-                epochs=pretrain_epochs,
-                lr=pretrain_lr,
-                wd=pretrain_wd,
-                neg_per_pos=1,  # try 1–5
-                batch_size=65536,  # tune per memory
-                use_bilinear=True,  # dot is fine too
-                edge_dropout=0.1,  # 0.0–0.2 is common
-                temp=1.0,
-                log_every=max(1, pretrain_epochs // 5),
-                topk_pos_ratio=0.25,  # work on top 25% hardest positives
-                topk_pos_mode="loss",  # rank by BCE loss vs 1
-                hard_negatives=True,  # hardest negatives per batch
-                neg_oversample=4,  # 4x pool for hard-neg mining
-            )
-        else:
-            logging.info("[Selector] Using encoder (pregnn_trained=%s).", getattr(self, "_pregnn_trained", False))
-        '''
-
-        # 1) Saliency score arXiv:2201.13291v3
         sal = self._node_saliency_from_victim(subset="attack").to(dev)
         sal = (sal - sal.mean()) / (sal.std() + 1e-6)
 
@@ -1453,9 +1990,6 @@ class PRBCD(SparseAttack):
             prefer_edges: str = "mix",
             max_intra_ratio: float = 0.5,
     ):
-        """
-        Guided resampling using PGD node saliency as the teacher for the selector.
-        """
         if self.keep_heuristic != "WeightOnly":
             raise NotImplementedError("Only keep_heuristic=`WeightOnly` supported")
 
@@ -1513,54 +2047,6 @@ class PRBCD(SparseAttack):
         if self.current_search_space.size(0) <= n_perturbations:
             logging.warning("[SelectorResample] Block size %d ≤ n_perturbations %d; consider increasing block_size.",
                             self.current_search_space.size(0), n_perturbations)
-
-    def resample_random_block(self, n_perturbations: int): #TODO: still work to be done
-        if self.keep_heuristic == 'WeightOnly':
-            sorted_idx = torch.argsort(self.perturbed_edge_weight)
-            idx_keep = (self.perturbed_edge_weight <= self.eps).sum().long()
-            # Keep at most half of the block (i.e. resample low weights)
-            if idx_keep < sorted_idx.size(0) // 2:
-                idx_keep = sorted_idx.size(0) // 2
-        else:
-            raise NotImplementedError('Only keep_heuristic=`WeightOnly` supported')
-
-        sorted_idx = sorted_idx[idx_keep:]
-        self.current_search_space = self.current_search_space[sorted_idx]
-        self.modified_edge_index = self.modified_edge_index[:, sorted_idx]
-        self.perturbed_edge_weight = self.perturbed_edge_weight[sorted_idx]
-
-        # Sample until enough edges were drawn
-        for i in range(self.max_final_samples):
-            n_edges_resample = self.block_size - self.current_search_space.size(0)
-            lin_index = torch.randint(self.n_possible_edges, (n_edges_resample,), device=self.device)
-
-            self.current_search_space, unique_idx = torch.unique(
-                torch.cat((self.current_search_space, lin_index)),
-                sorted=True,
-                return_inverse=True
-            )
-
-            if self.make_undirected:
-                self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
-            else:
-                self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
-
-            # Merge existing weights with new edge weights
-            perturbed_edge_weight_old = self.perturbed_edge_weight.clone()
-            self.perturbed_edge_weight = torch.full_like(self.current_search_space, self.eps, dtype=torch.float32)
-            self.perturbed_edge_weight[
-                unique_idx[:perturbed_edge_weight_old.size(0)]
-            ] = perturbed_edge_weight_old
-
-            if not self.make_undirected:
-                is_not_self_loop = self.modified_edge_index[0] != self.modified_edge_index[1]
-                self.current_search_space = self.current_search_space[is_not_self_loop]
-                self.modified_edge_index = self.modified_edge_index[:, is_not_self_loop]
-                self.perturbed_edge_weight = self.perturbed_edge_weight[is_not_self_loop]
-
-            if self.current_search_space.size(0) > n_perturbations:
-                return
-        raise RuntimeError('Sampling random block was not successfull. Please decrease `n_perturbations`.')
 
     def resample_random_block_from_cert_radii(self, grid_radii, n_perturbations: int = 0): #TODO: still work to be done
         #self.current_node_search_space = np.where(grid_radii[:, 2, 2] == False)[0]
@@ -1739,40 +2225,40 @@ class PRBCD(SparseAttack):
         self._selector_log_probs = torch.stack(logps)
 
     def _make_margin_labels(self):
-        """
-        Teacher labels from the victim: margin_i = top1_logit - top2_logit (clean graph).
-        Returns z-scored margins (N,).
-        """
         with torch.no_grad():
             x = self.attr.to(self.device)
             ei = self.edge_index.to(self.device)
-            # fall back to ones if edge_weight is None
-            if self.edge_weight is None:
+
+            ew = self.edge_weight
+            if ew is None:
                 ew = torch.ones(ei.size(1), device=self.device)
             else:
-                ew = self.edge_weight.to(self.device)
+                ew = ew.to(self.device)
 
-            logits = self.attacked_model(data=x, adj=(ei, ew))  # <-- victim
-            top2 = torch.topk(logits, k=2, dim=1).values  # (N, 2)
-            margins = (top2[:, 0] - top2[:, 1]).clamp_min(0.0)  # (N,)
-            return (margins - margins.mean()) / (margins.std() + 1e-6)
+            logits = self.attacked_model(data=x, adj=(ei, ew))
+
+            top2_vals = torch.topk(logits, k=2, dim=1).values
+            margins = (top2_vals[:, 0] - top2_vals[:, 1]).clamp_min(0.0)
+
+            mean, std = margins.mean(), margins.std().clamp_min(1e-6)
+            return (margins - mean) / std
 
     def _pretrain_margin_scorer(self, epochs: int = 20, lr: float = 1e-3, wd: float = 5e-4):
         logging.info(f"[Selector] Pretraining NodeBlockScorer for {epochs} epochs "
                      f"(lr={lr}, wd={wd}, device={self.device}).")
         self.selector.train()
-        y = self._make_margin_labels().to(self.device)  # (N,)
+        y = self._make_margin_labels().to(self.device)
 
         x = self.attr.to(self.device)
         ei = self.edge_index.to(self.device)
-        ew = self.edge_weight.to(self.device) if self.edge_weight is not None else None
+        ew = self.edge_weight.to(self.device)
 
         opt = torch.optim.Adam(self.selector.parameters(), lr=lr, weight_decay=wd)
         with torch.enable_grad():
             for e in range(epochs):
                 opt.zero_grad()
-                h = self.selector.embed(x, ei, ew)  # (N,d)
-                pred = self.selector.node_head(h).squeeze(-1)  # (N,)
+                h = self.selector.embed(x, ei, ew)
+                pred = self.selector.node_head(h).squeeze(-1)
                 loss = F.smooth_l1_loss(pred, y)
                 loss.backward()
                 opt.step()
@@ -2130,6 +2616,54 @@ class PRBCD(SparseAttack):
         mask = row_idx < col_idx
         #returns undirected triu matrix
         return matrix[:, mask]
+
+    @staticmethod
+    def pairs_to_linear_uppertri(pairs: torch.Tensor, N: int, *, drop_self_loops: bool = True) -> torch.Tensor:
+        """
+        Convert 2×b node index pairs into a (b,) vector of linear indices over the
+        upper-triangular part (u < v) of an N×N matrix, row-major over (u,v).
+
+        Mapping (u < v) -> k:
+            k = u*(2*N - u - 1)//2 + (v - u - 1)
+        Range: k ∈ [0, N*(N-1)//2)
+
+        Args:
+            pairs: LongTensor of shape (2, b) or (b, 2). Each pair is (u, v).
+            N:     number of nodes.
+            drop_self_loops: if True, removes u==v; if False, they’re filtered anyway by u<v.
+
+        Returns:
+            lin: LongTensor of shape (b_valid,), linear indices for valid u<v pairs.
+        """
+        # Accept either (2,b) or (b,2)
+        if pairs.dim() != 2 or not (pairs.size(0) == 2 or pairs.size(1) == 2):
+            raise ValueError("pairs must be shape (2, b) or (b, 2) of longs")
+        if pairs.size(0) == 2:
+            u, v = pairs[0], pairs[1]
+        else:
+            u, v = pairs[:, 0], pairs[:, 1]
+
+        # Make undirected by ordering (u,v) -> (min,max)
+        uu = torch.minimum(u, v)
+        vv = torch.maximum(u, v)
+
+        # Keep only strict upper-tri (uu < vv)
+        mask = uu < vv
+        if drop_self_loops:
+            # already excluded by uu < vv, but keeps intent explicit
+            pass
+
+        if mask.sum() == 0:
+            return torch.empty(0, dtype=torch.long, device=pairs.device)
+
+        uu = uu[mask]
+        vv = vv[mask]
+
+        # Apply the closed-form linearization for the upper triangle
+        # k = uu*(2N - uu - 1)//2 + (vv - uu - 1)
+        N = int(N)
+        lin = uu * (2 * N - uu - 1) // 2 + (vv - uu - 1)
+        return lin
 
     @staticmethod
     def flip_matrix_idx_to_triu_idx(matrix: torch.tensor) -> torch.tensor:

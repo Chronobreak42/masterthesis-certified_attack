@@ -59,64 +59,12 @@ def config():
 
     debug_level = "info"
 
-
 @ex.automain
-def run(data_dir: str, dataset: str, attack: str, attack_params: Dict[str, Any], epsilons: Sequence[float],
+def run(graph, data_dir: str, dataset: str, attack: str, attack_params: Dict[str, Any], epsilons: Sequence[float],
         binary_attr: bool, make_undirected: bool, seed: int, artifact_dir: str, pert_adj_storage_type: str,
         pert_attr_storage_type: str, model_label: str, model_storage_type: str, device: Union[str, int],
-        data_device: Union[str, int], debug_level: str, semi: bool, use_cert: str = "none", grid_radii: Optional[np.ndarray] = None, grid_binary_class: Optional[np.ndarray] = None):
-    """
-    Instantiates a sacred experiment executing a global direct attack run for a given model configuration.
-    Caches the perturbed adjacency to storage and evaluates the models perturbed accuracy. 
-    Global evasion attacks allow all nodes of the graph to be perturbed under the given budget.
-    Direct attacks are used to attack a model without the use of a surrogate model.
-
-    Parameters
-    ----------
-    data_dir : str
-        Path to data folder that contains the dataset
-    dataset : str
-        Name of the dataset. Either one of: `cora_ml`, `citeseer`, `pubmed` or an ogbn dataset
-    device : Union[int, torch.device]
-        The device to use for training. Must be `cpu` or GPU id
-    data_device : Union[int, torch.device]
-        The device to use for storing the dataset. For batched models (like PPRGo) this may differ from the device parameter. 
-        In all other cases device takes precedence over data_device
-    make_undirected : bool
-        Normalizes adjacency matrix with symmetric degree normalization (non-scalable implementation!)
-    binary_attr : bool
-        If true the attributes are binarized (!=0)
-    attack : str
-        The name of the attack class to use. Supported attacks are:
-            - PRBCD
-            - GreedyRBCD
-            - DICE
-            - FGSM
-            - PGD
-    attack_params : Dict[str, Any], optional
-        The attack hyperparams to be passed as keyword arguments to the constructor of the attack class
-    epsilons: List[float]
-        The budgets for which the attack on the model should be executed.
-    model_label : str, optional
-        The name given to the model at train time using the experiment_train.py 
-        This name is used as an identifier in combination with the dataset configuration to retrieve 
-        the model to be attacked from storage. If None, all models that were fit on the given dataset 
-        are attacked.
-    artifact_dir: str
-        The path to the folder that acts as TinyDB Storage for pretrained models
-    model_storage_type: str
-        The name of the storage (TinyDB) table name the model to be attacked is retrieved from.
-    pert_adj_storage_type: str
-        The name of the storage (TinyDB) table name the perturbed adjacency matrix is stored to
-    pert_attr_storage_type: str
-        The name of the storage (TinyDB) table name the perturbed attribute matrix is stored to
-
-    Returns
-    -------
-    List[Dict[str, any]]
-        List of result dictionaries. One for every combination of model and epsilon.
-        Each result dictionary contains the model labels, epsilon value and the perturbed accuracy
-    """
+        data_device: Union[str, int], debug_level: str, semi: bool, use_cert: str = "none",
+        grid_radii: Optional[np.ndarray] = None, grid_binary_class: Optional[np.ndarray] = None):
 
     results = []
     surrogate_model_label = False
@@ -129,14 +77,27 @@ def run(data_dir: str, dataset: str, attack: str, attack_params: Dict[str, Any],
         data_device, debug_level, ex
     )
 
-    if model_label is not None and model_label:
+    if model_label:
         model_params['label'] = model_label
 
     models_and_hyperparams = storage.find_models(model_storage_type, model_params)
 
-    # NEW: we'll keep the latest gradient and attack stats we observe
     last_gradient = None
-    last_attack_stats = None  # dict of lists
+    last_attack_stats = None  # dict[str, list]
+
+    # --- helper to normalize stats -> plain lists/floats ---
+    def _to_plain_list(seq):
+        out = []
+        for x in seq:
+            # try tensor -> .item(), numpy -> .item(), else keep as-is
+            try:
+                out.append(float(x))
+            except Exception:
+                try:
+                    out.append(x.item())
+                except Exception:
+                    out.append(x)
+        return out
 
     for model, hyperparams in models_and_hyperparams:
         model_label = hyperparams["label"]
@@ -149,12 +110,12 @@ def run(data_dir: str, dataset: str, attack: str, attack_params: Dict[str, Any],
 
         for epsilon in epsilons:
             # run the attack (may load from cache or actually optimize)
-            gradient = run_global_attack(
-                epsilon, m, storage, pert_adj_storage_type, pert_attr_storage_type,
-                pert_params, adversary, model_label, semi=semi, use_cert=use_cert,
+            gradient = run_global_attack(graph=graph,
+                epsilon=epsilon, m=m, storage=storage, pert_adj_storage_type=pert_adj_storage_type, pert_attr_storage_type=pert_attr_storage_type,
+                pert_params=pert_params, adversary=adversary, model_label=model_label, semi=semi, use_cert=use_cert,
                 grid_radii=grid_radii, grid_binary_class=grid_binary_class
             )
-            last_gradient = gradient  # NEW: keep for return
+            last_gradient = gradient  # keep for return
 
             # evaluate on the adversarial graph
             adj_adversary = adversary.adj_adversary
@@ -171,12 +132,13 @@ def run(data_dir: str, dataset: str, attack: str, attack_params: Dict[str, Any],
                 'accuracy': accuracy
             })
 
-            # NEW: capture per-epoch attack statistics for CSV logging
-            # adversary.attack_statistics is a defaultdict(list); cast to plain dict
-            if hasattr(adversary, "attack_statistics") and adversary.attack_statistics:
-                last_attack_stats = {k: list(v) for k, v in adversary.attack_statistics.items()}
+            # ---- ALWAYS capture per-epoch stats for the *current* run ----
+            stats_obj = getattr(adversary, "attack_statistics", None)
+            if stats_obj:
+                last_attack_stats = {k: _to_plain_list(v) for k, v in stats_obj.items()}
             else:
-                last_attack_stats = None  # nothing was recorded (e.g., loaded from cache)
+                # ensure the key exists in the final return even if empty (e.g., cached path)
+                last_attack_stats = {}
 
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -184,9 +146,9 @@ def run(data_dir: str, dataset: str, attack: str, attack_params: Dict[str, Any],
 
     assert len(results) > 0
 
-    # NEW: include attack_statistics so your outer script can write the per-epoch CSV
+    # ---- return dict includes stats no matter the use_cert mode ----
     return {
         'results': results,
         'gradient': last_gradient,
-        'attack_statistics': last_attack_stats  # <-- your loop reads this
+        'attack_statistics': last_attack_stats,  # <— your CSV writer will find this
     }

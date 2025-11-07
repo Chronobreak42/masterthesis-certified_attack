@@ -94,7 +94,7 @@ def prepare_attack_experiment(data_dir: str, dataset: str, attack: str, attack_p
     return attr, adj, labels, idx_train, idx_val, idx_test, storage, attack_params, pert_params, model_params, m
 
 
-def run_global_attack(epsilon, m, storage, pert_adj_storage_type, pert_attr_storage_type,
+def run_global_attack(graph, epsilon, m, storage, pert_adj_storage_type, pert_attr_storage_type,
                       pert_params, adversary, model_label,semi, use_cert, grid_radii: Optional[np.ndarray] = None, grid_binary_class: Optional[np.ndarray] = None):
 
     n_perturbations = int(round(epsilon * m))
@@ -108,7 +108,25 @@ def run_global_attack(epsilon, m, storage, pert_adj_storage_type, pert_attr_stor
         adversary.set_pertubations(pert_adj, pert_attr)
     else:
         logging.info(f"No cached perturbations found for model '{model_label}' and eps {epsilon}. Execute attack...")
-        gradient = adversary.attack(n_perturbations, semi = semi, use_cert = use_cert, grid_radii = grid_radii, grid_binary_class = grid_binary_class)
+        import inspect
+
+        # ... inside run_global_attack(...)
+        attack_sig = inspect.signature(adversary.attack)
+        needs_graph = "graph" in attack_sig.parameters
+
+        attack_kwargs = dict(
+            n_perturbations=n_perturbations,
+            semi=semi,
+            use_cert=use_cert,
+            grid_radii=grid_radii,
+            grid_binary_class=grid_binary_class,
+        )
+
+        if needs_graph:
+            attack_kwargs["graph"] = graph  # only pass if required
+
+        gradient = adversary.attack(**attack_kwargs)
+        '''gradient = adversary.attack(edge_idx=edge_idx, attr_idx=attr_idx, n_perturbations=n_perturbations, semi = semi, use_cert = use_cert, grid_radii = grid_radii, grid_binary_class = grid_binary_class)'''
         pert_adj, pert_attr = adversary.get_pertubations()
 
         if n_perturbations > 0:
