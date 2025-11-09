@@ -110,7 +110,6 @@ def run_global_attack(graph, epsilon, m, storage, pert_adj_storage_type, pert_at
         logging.info(f"No cached perturbations found for model '{model_label}' and eps {epsilon}. Execute attack...")
         import inspect
 
-        # ... inside run_global_attack(...)
         attack_sig = inspect.signature(adversary.attack)
         needs_graph = "graph" in attack_sig.parameters
 

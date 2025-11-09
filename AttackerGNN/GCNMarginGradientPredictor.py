@@ -22,5 +22,5 @@ class TinyGCN(nn.Module):
 
 def tanh_margin_loss_label_free(logits: torch.Tensor) -> torch.Tensor:
     top2 = logits.topk(2, dim=1).values               # (N, 2)
-    margin = top2[:, 0] - top2[:, 1]                  # ψ = z_top1 - z_top2
+    margin = top2[:, 0] - top2[:, 1]                  # z_score = z_top1 - z_top2
     return (-torch.tanh(margin)).mean()
