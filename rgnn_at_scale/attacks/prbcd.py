@@ -54,7 +54,7 @@ class PRBCD(SparseAttack):
         self.semi = None
         self.score = None
         self.degrees = None
-        self.weights_p = None
+        self.node_probability = None
 
         if self.make_undirected:
             self.n_possible_edges = self.n * (self.n - 1) // 2
@@ -87,13 +87,15 @@ class PRBCD(SparseAttack):
         self.attack_statistics = defaultdict(list)
 
         # Sample initial search space (Algorithm 1, line 3-4)
-        if use_cert in ("sampling_grid_radii", "sampling_grid_radii_alt_11", "both_1", "both_2_random"):
-            self.sample_block_from_certificates_radii(grid_radii=grid_radii, n_perturbations=n_perturbations)
-        elif use_cert in ("sampling_grid_binary_class", "sampling_grid_binary_class_alt_11", "sampling_grid_binary_class_alt_22", "both_2"):
-            print(use_cert, "run sampling_grid_binary_class")
-            self.sample_block_from_certificates_binary_class(grid_binary_class=grid_binary_class, n_perturbations=n_perturbations)
-        elif use_cert in ("sampling_with_score", "sampling_with_score_degree", "both_3"):
-            print(use_cert, "run sample_block_from_score")
+        if use_cert in ("sampling_grid_radii", "sampling_grid_radii_alt_11", "both_1", "both_2_random","sampling_grid_binary_class", "sampling_grid_binary_class_alt_11", "both_2"):
+            self.sample_block_use_cert(grid_radii=grid_radii, grid_binary_class=grid_binary_class, n_perturbations=n_perturbations)
+        elif use_cert in ("sampling_with_score", "sampling_with_score_degree",
+                          "sampling_with_score_ra_degree", "sampling_with_score_rd_degree",
+                          "sampling_with_score_ra", "sampling_with_score_rd",
+                          "sampling_with_score_rd+ra_degree",
+                          "sampling_with_score_rd+ra_degree", "sampling_with_degree^2", "resampling_with_degree^2"
+                          "both_3"):
+            print(use_cert, "run sample_block_from_score_or_degree")
             self.sample_block_from_score(n_perturbations)
         else:
             print(use_cert, "run sampling with no certificate")
@@ -173,7 +175,11 @@ class PRBCD(SparseAttack):
                         print(use_cert, "run resampling_grid_binary_class")
                         self.resample_random_block_from_cert_binary_class(grid_binary_class=grid_binary_class,
                                                                   n_perturbations=n_perturbations)
-                    elif use_cert in ("resampling_with_score", "resampling_with_score_degree", "both_3"):
+                    elif use_cert in ("resampling_with_score", "resampling_with_score_degree",
+                                      "resampling_with_score_ra_degree", "resampling_with_score_rd_degree",
+                                      "resampling_with_score_ra", "resampling_with_score_rd",
+                                      "resampling_with_score_rd+ra_degree",
+                                      "both_3"):
                         print("run", use_cert)
                         self.resample_random_block_from_score(n_perturbations=n_perturbations)
                     else:
@@ -207,6 +213,8 @@ class PRBCD(SparseAttack):
         # TODO: Don't we want to switch to returning things? Haha yeah me too
 
     def _get_logits(self, attr: torch.Tensor, edge_index: torch.Tensor, edge_weight: torch.Tensor):
+        a = attr.to(self.device)
+        b = edge_index.to(self.device), edge_weight.to(self.device)
         return self.attacked_model(
             data=attr.to(self.device),
             adj=(edge_index.to(self.device), edge_weight.to(self.device))
@@ -225,6 +233,14 @@ class PRBCD(SparseAttack):
                 sampled_edges = torch.zeros_like(perturbed_edge_weight)
                 sampled_edges[torch.topk(perturbed_edge_weight, n_perturbations).indices] = 1
             else:
+                # Ensure all values are within [0, 1]
+                perturbed_edge_weight[perturbed_edge_weight < 0] = 0.0
+                perturbed_edge_weight[perturbed_edge_weight > 1] = 1.0
+
+                # Replace any NaN or inf values
+                perturbed_edge_weight = torch.nan_to_num(perturbed_edge_weight, nan=0.5, posinf=1.0, neginf=0.0)
+
+                # Sample safely
                 sampled_edges = torch.bernoulli(perturbed_edge_weight).float()
 
             if sampled_edges.sum() > n_perturbations:
@@ -363,15 +379,28 @@ class PRBCD(SparseAttack):
                 return
         raise RuntimeError('Sampling random block was not successfull. Please decrease `n_perturbations`.')
 
-    def sample_block_from_certificates_radii(self, grid_radii, n_perturbations: int = 0):
+    def sample_block_use_cert(self, grid_radii, grid_binary_class , n_perturbations: int = 0):
         for _ in range(self.max_final_samples):
             # Tried different grid_cells to use for. [1,1] and [2,2] showed best results (determined with 5 examples each)
+
             if self.use_cert in ("sampling_grid_radii_alt_11",):
                 print(self.use_cert, "run sampling_grid_radii_alt_11")
                 self.current_node_search_space = np.where(grid_radii[:, 1, 1] == False)[0]
-            else:
+
+            elif self.use_cert in ("sampling_grid_radii", "both_1", "both_2_random"):
                 print(self.use_cert, "run sampling_grid_radii")
                 self.current_node_search_space = np.where(grid_radii[:, 2, 2] == False)[0]
+
+            elif self.use_cert in ("sampling_grid_binary_class", "sampling_grid_binary_class_alt_11","both_2"):
+                print(self.use_cert, "run sampling_grid_binary_class")
+                print("using alternative current_node_search_space sampling")
+                self.sample_current_node_search_space_det(grid_binary_class)
+
+            elif self.use_cert in ("sampling_grid_binary_class",):
+                print(self.use_cert, "run sampling_grid_binary_class")
+                sums = np.sum(grid_binary_class, axis=(1, 2))  # shape: (2810,)
+                smallest_indices = np.argsort(sums)[:len(sums) // 2]
+                self.current_node_search_space = torch.from_numpy(smallest_indices)
             # draw edges: draw nodes from current_node_search_space and concatenate
             # TODO: The following lines till setup_search_space_undirected could be improved in terms of readability, change method outputs
             if not self.semi:
@@ -388,40 +417,6 @@ class PRBCD(SparseAttack):
                 # self.setup_search_space_undirected(self.n) with the two lines above this method is NOT needed anymore
                 # TODO: This will cut arbitrary number of entries, I made a function draw_undirected_matrix() to bypass this, but may be slow
                 # maybe return later to this idea
-            else:
-                # TODO: i have not checked if it works for the directed case, I think it will NOT work
-                self.modified_edge_index = PRBCD.cut_diagonal_entries(edges_idx)
-
-            self.perturbed_edge_weight = torch.full_like(
-                self.current_search_space, self.eps, dtype=torch.float32, requires_grad=True
-            )
-            if self.current_search_space.size(0) >= n_perturbations:
-                return
-        raise RuntimeError('Sampling random block was not successfull. Please decrease `n_perturbations`.')
-
-    def sample_block_from_certificates_binary_class(self, grid_binary_class, n_perturbations: int = 0):
-        for _ in range(self.max_final_samples):
-
-            if self.use_cert in ("sampling_grid_binary_class_alt_11", "sampling_grid_binary_class_alt_22"):
-                print("using alternative current_node_search_space sampling")
-                self.sample_current_node_search_space_det(grid_binary_class)
-            else:
-                sums = np.sum(grid_binary_class, axis=(1, 2))  # shape: (2810,)
-                smallest_indices = np.argsort(sums)[:len(sums) // 2]
-                self.current_node_search_space = torch.from_numpy(smallest_indices)
-
-            # draw edges: draw nodes from current_node_search_space and concatenate
-            if not self.semi:
-                edges_idx = self.build_full_idx_matrix(False, self.block_size)
-            else:
-                self.build_full_idx_matrix_semi(False, self.block_size)
-            # bis hierhin wird für die gesamte Blockmatrix gezogen
-
-            if self.make_undirected:
-                # make undirected: cut all (x,y) where x >= y
-                self.current_search_space = self.edges_to_current_search_space(self.n)
-                self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
-                # self.setup_search_space_undirected(self.n) this method is not needed anymore
             else:
                 # TODO: i have not checked if it works for the directed case, I think it will NOT work
                 self.modified_edge_index = PRBCD.cut_diagonal_entries(edges_idx)
@@ -737,24 +732,31 @@ class PRBCD(SparseAttack):
         self.edges_to_attack_index = torch.cat([self.edges_to_attack_index, edges_idx], dim=1)
         return edges_idx
 
-    def build_full_idx_matrix_from_score(self, reset: bool, sample_size: int):
+    def build_full_idx_matrix_from_score(self, reset: bool, sample_size: int, elseif=None):
         if reset:
             # empty edges_to_attack_index for resample or other cases
             self.edges_to_attack_index = torch.empty((2, 0), dtype=torch.long)
-        #TODO: Refactor! these computation can be outsosurced so it is only runned once!!
-        if self.weights_p is None:
-            print("Calculating weights_p")
+        if self.node_probability is None:
+            print("Calculating node_probability")
             ones = np.ones_like(self.score, dtype=float)
-            self.weights_p = torch.from_numpy(ones / self.score)
-            self.weights_p = torch.pow(self.weights_p, 2)
-            if self.use_cert in ("sampling_with_score_degree", "resampling_with_score_degree"):
-                print("using degree/score")
-                self.weights_p = self.degrees + self.weights_p
-        nodes_1 = torch.tensor(random.choices(self.current_node_search_space, weights=self.weights_p,  k=sample_size))
+            self.node_probability = torch.from_numpy(ones / self.score)
+            self.node_probability = torch.pow(self.node_probability, 2)
+            if self.use_cert in ("sampling_with_score_degree", "resampling_with_score_degree",
+                                 "sampling_with_score_ra_degree", "resampling_with_score_ra_degree",
+                                 "sampling_with_score_rd_degree", "resampling_with_score_rd_degree"):
+                print(self.use_cert + ": 1/(score^2*degree)")
+                self.node_probability = self.node_probability/self.degrees #hat bisher besten angriff erzeugt
+                #self.node_probability = self.degrees + self.node_probability
+                #self.node_probability = self.degrees*self.node_probability
+            elif self.use_cert in ("sampling_with_degree^2", "resampling_with_degree^2"):
+                print("1/(degree^2)")
+                self.node_probability = ones/(self.degrees)
+                self.node_probability = torch.pow(self.node_probability, 2)
+        nodes_1 = torch.tensor(random.choices(self.current_node_search_space, weights=self.node_probability, k=sample_size))
         if self.semi:
             nodes_2 = torch.randint(self.n, (sample_size,), device=self.device)
         else:
-            nodes_2 = torch.tensor(random.choices(self.current_node_search_space, weights=self.weights_p,  k=sample_size))
+            nodes_2 = torch.tensor(random.choices(self.current_node_search_space, weights=self.node_probability, k=sample_size))
         edges_idx = torch.cat([nodes_1.unsqueeze(0), nodes_2.unsqueeze(0)], dim=0)
         self.edges_to_attack_index = torch.cat([self.edges_to_attack_index, edges_idx], dim=1)
         return edges_idx
@@ -775,10 +777,19 @@ class PRBCD(SparseAttack):
         # so lowest score is 1
         last_row_index[~row_mask.any(axis=1)] = 1
         last_col_index[~col_mask.any(axis=1)] = 1
-
-        #max_radii = np.stack([last_row_index, last_col_index], axis=1)
-
         score = last_row_index * last_col_index
+        #max_radii = np.stack([last_row_index, last_col_index], axis=1)
+        if self.use_cert in ("sampling_with_score_ra_degree", "resampling_with_score_ra_degree",
+                             "sampling_with_score_ra", "resampling_with_score_ra"):
+            print("using ra as score")
+            score = last_row_index
+        elif self.use_cert in ("sampling_with_score_rd_degree", "resampling_with_score_rd_degree",
+                               "sampling_with_score_rd", "resampling_with_score_rd"):
+            print("using rd as score")
+            score = last_col_index
+        elif self.use_cert in ("sampling_with_score_rd+ra_degree", "resampling_with_score_rd+ra_degree"):
+            print("using rd+ra as score")
+            score = last_col_index+last_col_index
         return score
 
     def setup_search_space_undirected(self, n: int):
