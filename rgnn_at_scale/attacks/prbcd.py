@@ -14,6 +14,7 @@ from torch_geometric.utils import negative_sampling
 from tqdm import tqdm
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch_sparse
 from torch_sparse import SparseTensor
@@ -25,10 +26,12 @@ import AttackerGNN.gnn_score_all as sall
 from AttackerGNN.GCNLinkPredictor import GCNLinkPredictor
 from AttackerGNN.GCNMarginGradientPredictor import TinyGCN, tanh_margin_loss_label_free
 from AttackerGNN.DynamicSampler import SamplerGNN
+from AttackerGNN.ShadowModelLinkPredictor import LinkPredictionGNN
 
 # from rgnn_at_scale.models import MODEL_TYPE
 from rgnn_at_scale.helper import utils
 from rgnn_at_scale.attacks.base_attack import Attack, SparseAttack
+import os
 
 
 class PRBCD(SparseAttack):
@@ -113,7 +116,7 @@ class PRBCD(SparseAttack):
 
         self.lr_factor = lr_factor * max(math.log2(self.n_possible_edges / self.block_size), 1.)
 
-    def _attack(self, graph, n_perturbations, semi=False, use_cert="none", grid_radii: Optional[np.ndarray] = None, grid_binary_class: Optional[np.ndarray] = None, **kwargs):
+    def _attack(self, ads_mode, graph, n_perturbations, semi=False, use_cert="none", grid_radii: Optional[np.ndarray] = None, grid_binary_class: Optional[np.ndarray] = None, **kwargs):
         """Perform attack (`n_perturbations` is increasing as it was a greedy attack).
 
         Parameters
@@ -163,8 +166,42 @@ class PRBCD(SparseAttack):
             print(use_cert, "-> using selector gradient gcn")
             self.sample_block_from_margin_loss_gcn(graph=graph)
         elif use_cert in ("accuracy_drop_selector",):
-            print(use_cert, "-> using accuracy drop selector")
-            y_out, tried_set, harmful_set = self.label_edge_flips_prbcd_selfsample_fast()
+            print(use_cert, "-> sampling with accuracy drop selector")
+            self.n_candidates_k_sample=2000
+            cache_path = f"cache/selection_ads_{ads_mode}_k{self.n_candidates_k_sample}.pt"
+
+            if os.path.exists(cache_path):
+                print("[CACHE] loading selection:", cache_path)
+                y_out, edge_index_lab, y_label, tried_set, harmful_set, meta = PRBCD.load_selection(cache_path,
+                                                                                              device=self.device)
+            else:
+                print("[CACHE] computing selection and saving:", cache_path)
+                self.n_candidates_k_sample = 2000
+                y_out, edge_index_lab, y_label, tried_set, harmful_set = self.label_edge_flips_prbcd_selfsample_fast(
+                    mode=ads_mode,
+                    n_candidates_k_sample=self.n_candidates_k_sample,
+                    drop_threshold_k_samples=3e-3
+                )
+                meta = {
+                    "ads_mode": ads_mode,
+                    "n_candidates_k_sample": self.n_candidates_k_sample,
+                    "drop_threshold_k_samples": 3e-3,
+                }
+                PRBCD.save_selection(cache_path, y_out, edge_index_lab, y_label, tried_set, harmful_set, meta=meta)
+
+            X, edge_index_struct = self.extract_X_and_edge_index_from_sparsegraph(graph)
+            self.lp_model = self.train_link_prediction_gnn(
+                x=X,
+                edge_index_struct=edge_index_struct,
+                edge_index_lab=edge_index_lab,
+                y_label=y_label,
+                device=self.device,
+                num_epochs=200,
+                use_tqdm=True,
+                verbose=True,
+            )
+            self.init_search_space_from_y_out(y_out=y_out,n_perturbations=n_perturbations)
+            self.tried_set = tried_set
         else:
             print(use_cert, "run sampling with no certificate")
             self.sample_random_block(n_perturbations)
@@ -288,6 +325,17 @@ class PRBCD(SparseAttack):
                         print(use_cert, "run resampling_with_prior")
                         self.resample_block_from_prior_gumbel(n_perturbations=n_perturbations, tau=1.0)
 
+                    elif use_cert in ("accuracy_drop_selector",):
+                        if epoch % 5 == 0:
+                            print(use_cert, "-> resampling with accuracy drop selector")
+                            y_out, edge_index_lab, y_label, tried_set, harmful_set = self.label_edge_flips_prbcd_selfsample_fast(mode=ads_mode,
+                                                                                                    n_candidates_k_sample=int(self.n_candidates_k_sample / 2),
+                                                                                                    prev_tried_set=self.tried_set,
+                                                                                                    drop_threshold_k_samples=3e-3)
+                            self.append_search_space_with_y_out(y_out=y_out)
+                            self.tried_set = tried_set
+                        else:
+                            pass
 
                     elif use_cert in ("selector_block", "selector_block_pgd"):
 
@@ -335,6 +383,7 @@ class PRBCD(SparseAttack):
                     else:
                         print(use_cert, "run resampling with no certificate")
                         self.resample_random_block(n_perturbations)
+                        pass
                 elif self.with_early_stopping and epoch == self.epochs_resampling - 1:
                     # Retreive best epoch if early stopping is active (not explicitly covered by pesudo code)
                     logging.info(
@@ -553,6 +602,179 @@ class PRBCD(SparseAttack):
             if self.current_search_space.size(0) >= n_perturbations:
                 return
         raise RuntimeError('Sampling random block was not successfull. Please decrease `n_perturbations`.')
+
+    def init_search_space_from_y_out(self, y_out: torch.Tensor, n_perturbations: int = 0):
+        """
+        Initialize self.current_search_space, self.modified_edge_index, and
+        self.perturbed_edge_weight based on the positions of ones in y_out.
+
+        Args:
+            y_out: Tensor of shape (n_possible_edges,), dtype=torch.uint8
+                   where 1 marks a harmful edge flip.
+            n_perturbations: optional threshold for minimum number of perturbations to initialize.
+        """
+        device = getattr(self, "device", "cpu")
+
+        # ---- collect indices of harmful flips
+        ones_idx = torch.nonzero(y_out, as_tuple=False).flatten()
+        if ones_idx.numel() == 0:
+            raise ValueError("No harmful edges found in y_out; cannot initialize search space.")
+
+        # ---- unique, sorted
+        self.current_search_space = torch.unique(ones_idx.to(device), sorted=True)
+
+        # ---- build modified edge index
+        if self.make_undirected:
+            self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+        else:
+            self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
+            is_not_self_loop = self.modified_edge_index[0] != self.modified_edge_index[1]
+            self.current_search_space = self.current_search_space[is_not_self_loop]
+            self.modified_edge_index = self.modified_edge_index[:, is_not_self_loop]
+
+        # ---- initialize perturbed edge weights
+        self.perturbed_edge_weight = torch.full_like(
+            self.current_search_space,
+            self.eps,
+            dtype=torch.float32,
+            device=device,
+            requires_grad=True
+        )
+
+        # ---- sanity check: at least n_perturbations if requested
+        if n_perturbations and self.current_search_space.size(0) < n_perturbations:
+            raise RuntimeError(
+                f"Insufficient harmful edges ({self.current_search_space.size(0)}) "
+                f"for requested n_perturbations={n_perturbations}."
+            )
+
+        return
+
+    def append_search_space_with_y_out(self, y_out: torch.Tensor, n_perturbations: int = 0):
+        """
+        Drop half of the current block according to keep_heuristic='WeightOnly',
+        then append harmful edges from y_out, and finally refill the block up to
+        self.block_size with random edges (preserving existing weights).
+
+        Args:
+            y_out: Tensor of shape (n_possible_edges,), dtype=torch.uint8
+                   where 1 marks a harmful edge flip.
+            n_perturbations: optional lower bound used as a stopping condition
+                             for the refill loop (like in resample_random_block).
+        """
+        import torch
+
+        device = getattr(self, "device", "cpu")
+
+        # -----------------------------
+        # 1) KEEP PHASE: drop low weights
+        # -----------------------------
+        if self.keep_heuristic == 'WeightOnly':
+            sorted_idx = torch.argsort(self.perturbed_edge_weight)  # ascending
+            idx_keep = (self.perturbed_edge_weight <= self.eps).sum().long()
+            # Keep at most half of the block (i.e. resample low weights)
+            if idx_keep < sorted_idx.size(0) // 2:
+                idx_keep = sorted_idx.size(0) // 2
+        else:
+            raise NotImplementedError('Only keep_heuristic=`WeightOnly` supported')
+
+        sorted_idx = sorted_idx[idx_keep:]
+
+        kept_lin = self.current_search_space[sorted_idx].to(device)
+        kept_w = self.perturbed_edge_weight[sorted_idx].to(device)
+
+        self.current_search_space = kept_lin
+        self.modified_edge_index = self.modified_edge_index[:, sorted_idx].to(device)
+        self.perturbed_edge_weight = kept_w
+
+        # -----------------------------
+        # 2) APPEND PHASE: add y_out harmful indices
+        # -----------------------------
+        ones_idx = torch.nonzero(y_out, as_tuple=False).flatten()
+        if ones_idx.numel() == 0:
+            raise ValueError("No harmful edges found in y_out; cannot append to search space.")
+
+        ones_idx = ones_idx.to(device)
+
+        # concatenate kept edges + new harmful edges, then unique+sorted
+        concat_lin = torch.cat([self.current_search_space, ones_idx], dim=0)
+
+        new_search_space, inv = torch.unique(
+            concat_lin,
+            sorted=True,
+            return_inverse=True
+        )
+
+        num_kept = kept_lin.size(0)
+        pos_kept = inv[:num_kept]  # positions of old kept edges in the new search space
+
+        # rebuild perturbed_edge_weight: old kept weights preserved, new edges get eps
+        new_w = torch.full(
+            (new_search_space.size(0),),
+            self.eps,
+            dtype=torch.float32,
+            device=device,
+        )
+        new_w[pos_kept] = kept_w
+
+        self.current_search_space = new_search_space
+        self.perturbed_edge_weight = new_w
+
+        # build modified_edge_index for this augmented block
+        if self.make_undirected:
+            self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+        else:
+            self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
+            is_not_self_loop = self.modified_edge_index[0] != self.modified_edge_index[1]
+            self.current_search_space = self.current_search_space[is_not_self_loop]
+            self.modified_edge_index = self.modified_edge_index[:, is_not_self_loop]
+            self.perturbed_edge_weight = self.perturbed_edge_weight[is_not_self_loop]
+        '''
+        # -----------------------------
+        # 3) REFILL PHASE: like resample_random_block
+        # -----------------------------
+        for _ in range(self.max_final_samples):
+            n_edges_resample = int(self.block_size) - int(self.current_search_space.size(0))
+            if n_edges_resample <= 0:
+                break
+
+            lin_index = torch.randint(self.n_possible_edges, (n_edges_resample,), device=device)
+
+            # concat old + random, then unique+sorted
+            concat_lin = torch.cat((self.current_search_space, lin_index))
+
+            self.current_search_space, unique_idx = torch.unique(
+                concat_lin,
+                sorted=True,
+                return_inverse=True
+            )
+
+            # rebuild modified_edge_index from updated search space
+            if self.make_undirected:
+                self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+            else:
+                self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
+
+            # merge existing weights with new edge weights
+            perturbed_edge_weight_old = self.perturbed_edge_weight.clone()
+            self.perturbed_edge_weight = torch.full(
+                (self.current_search_space.size(0),),
+                self.eps,
+                dtype=torch.float32,
+                device=device,
+            )
+            # the first len(perturbed_edge_weight_old) entries in concat_lin correspond to old weights
+            self.perturbed_edge_weight[unique_idx[:perturbed_edge_weight_old.size(0)]] = perturbed_edge_weight_old
+
+            if not self.make_undirected:
+                is_not_self_loop = self.modified_edge_index[0] != self.modified_edge_index[1]
+                self.current_search_space = self.current_search_space[is_not_self_loop]
+                self.modified_edge_index = self.modified_edge_index[:, is_not_self_loop]
+                self.perturbed_edge_weight = self.perturbed_edge_weight[is_not_self_loop]
+
+            if self.current_search_space.size(0) > n_perturbations:
+                return
+            '''
 
     def sample_block_from_certificates_radii(self, grid_radii, n_perturbations: int = 0):
         for _ in range(self.max_final_samples):
@@ -2444,159 +2666,695 @@ class PRBCD(SparseAttack):
 
     def label_edge_flips_prbcd_selfsample_fast(
             self,
-            n_candidates: int = 10,
-            p_add: float = 0.06,
-            p_del: float = 0.1,
-            drop_threshold: float = 1e-3,
+            n_candidates_one_sample: int = 10,
+            n_candidates_k_sample: int = 2000,
+            p_add: float = 0.06,  # unused in uniform flip
+            p_del: float = 0.1,  # unused in uniform flip
+            drop_threshold_one_sample: float = 3e-3,
+            drop_threshold_k_samples: float = -1,
+            drop_threshold_k_hop: float = 1e-2,
             rng_seed: int = 0,
-            max_sampling_tries: int = 10_000
-    ) -> tuple[torch.Tensor, Set[tuple[int, float]], Set[tuple[int, float]]]:
-        """
-        Faster variant:
-          - Tracks seen/tried/harmful using a single linear edge index.
-          - No per-flip coalesce; deletions = zero weights, additions = tiny concat.
-          - Minimizes CPU<->GPU traffic.
+            max_sampling_tries: int = 100_000,
+            mode: str = "k_hop",  # one_sample | k_action | k_hop
+            k_samples_batch: int = 20,  # only used in k_action
+            n_candidates_k_hop_sample: int = 2000,  # target # of harmful flips in k_hop mode
+            k_hop: int = 2,  # hop radius for k_hop mode
+            prev_tried_set: "Set[tuple[int, float]] | None" = None,
+    ) -> tuple[torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    Set[tuple[int, float]],
+    Set[tuple[int, float]]]:
 
-        Returns:
-          y_out: (self.n_possible_edges,) uint8 (1 where harmful)
-          tried_set: {(lin_idx, drop)}
-          harmful_set: {(lin_idx, drop)}
-        """
         import torch
-        import numpy as np
+        from typing import Set, Tuple, Optional
 
         device = getattr(self, "device", "cpu")
-        torch.set_grad_enabled(False)
 
         n: int = int(self.n)
-        undirected: bool = bool(getattr(self, "make_undirected", True))
+        if n <= 1:
+            raise ValueError("Graph must have at least 2 nodes.")
 
-        # -- Base adjacency on device
-        ei_base = self.edge_index.to(device)  # (2,E)
+        # ---- base adjacency
+        ei_base = self.edge_index.to(device=device, dtype=torch.long).contiguous()  # (2,E)
         ew_base = (self.edge_weight.to(device).float()
                    if getattr(self, "edge_weight", None) is not None
-                   else torch.ones(ei_base.size(1), device=device, dtype=torch.float32))
+                   else torch.ones(ei_base.size(1), device=device, dtype=torch.float32)).contiguous()
 
-        # -- Directed lookup for O(1) deletion (only build once)
-        u_list = ei_base[0].tolist()
-        v_list = ei_base[1].tolist()
-        dir_map = {(int(a), int(b)): i for i, (a, b) in enumerate(zip(u_list, v_list))}
+        # ---- build undirected membership bitset
+        present = PRBCD._build_uppertri_bitset(ei_base, n)  # (num_pairs,) bool
 
-        # For undirected "exists?" checks when adding
-        if undirected:
-            und_set = {(min(a, b), max(a, b)) for a, b in zip(u_list, v_list) if a != b}
-        else:
-            und_set = None  # not used
+        E = ei_base.size(1)
+        dir_pos = torch.full((n, n), -1, dtype=torch.int32, device=device)
+        dir_pos[ei_base[0], ei_base[1]] = torch.arange(E, device=device, dtype=torch.int32)
 
-        # -- Baseline accuracy once
-        with torch.no_grad():
-            logits_clean = self.attacked_model(data=self.attr.to(device), adj=(ei_base, ew_base))
-            acc_clean = utils.accuracy(logits_clean, self.labels.to(device), self.idx_attack)
+        # ---- clean accuracy once
+        logits_clean = self.attacked_model(data=self.attr.to(device), adj=(ei_base, ew_base))
+        acc_clean = utils.accuracy(logits_clean, self.labels.to(device), self.idx_attack)
 
-        # -- Outputs
-        y_out = torch.zeros(int(self.n_possible_edges), dtype=torch.uint8, device=device)
-        tried_set: Set[Tuple[int, float]] = set()
+        # ---- outputs over *all* upper-tri pairs
+        num_pairs = n * (n - 1) // 2
+        y_out = torch.zeros(num_pairs, dtype=torch.uint8, device=device)
+
+        # ---- NEW: lists to collect labeled pairs (only tried pairs)
+        lab_u: list[int] = []
+        lab_v: list[int] = []
+        lab_k: list[int] = []  # linear indices k_lin for those pairs
+
+        # start tried_set from previous run if given
+        tried_set: Set[Tuple[int, float]] = set(prev_tried_set) if prev_tried_set is not None else set()
         harmful_set: Set[Tuple[int, float]] = set()
 
-        # -- Helpers for linear indexing
-        def lin_idx_for_pair(u: int, v: int) -> int:
-            if undirected:
-                uu, vv = (u, v) if u < v else (v, u)
-                full = torch.tensor([[uu], [vv]], dtype=torch.long, device=device)
-                return int(PRBCD.triu_idx_to_linear_idx(n, full).item())
-            else:
-                return int(u * n + v)
+        # ---- seen mask to avoid duplicate candidates (device-side)
+        seen = torch.zeros(num_pairs, dtype=torch.bool, device=device)
 
-        # -- Sampling loop: ensure >=1 flip, then up to n_candidates or tries cap
-        rng = np.random.default_rng(rng_seed)
+        # ---- helper: apply previous tried_set to seen ----
+        if prev_tried_set:
+            prev_indices = [idx for (idx, _drop) in prev_tried_set if 0 <= idx < num_pairs]
+            if prev_indices:
+                prev_tensor = torch.tensor(prev_indices, device=device, dtype=torch.long)
+                seen[prev_tensor] = True
+
+        # ---- torch RNG
+        g = torch.Generator(device=device)
+        g.manual_seed(int(rng_seed))
+
+        flips_done, tries = 0, 0
+
+        # ----- helper: build perturbed adjacency fresh from a batch of flips -----
+        def _build_perturbed_adj(flips):
+            """
+            Given a list of flips [(u, v, action, k_lin), ...],
+            build (ei_use, ew_use) from scratch based on ei_base, ew_base.
+            - 'del' -> set weights of (u,v) and (v,u) to 0 in the base part
+            - 'add' -> append directed edges (u,v) and (v,u)
+            """
+            ew_use = ew_base.clone()
+            del_indices = []
+            add_edges = []
+
+            for (u, v, action, _k_lin) in flips:
+                if action == "del":
+                    idx = int(dir_pos[u, v].item())
+                    if idx >= 0:
+                        del_indices.append(idx)
+                    idx2 = int(dir_pos[v, u].item())
+                    if idx2 >= 0:
+                        del_indices.append(idx2)
+                else:  # "add"
+                    add_edges.append((u, v))
+                    add_edges.append((v, u))
+
+            if del_indices:
+                del_idx_tensor = torch.tensor(del_indices, device=device, dtype=torch.long)
+                ew_use[del_idx_tensor] = 0.0
+
+            if add_edges:
+                extra_ei = torch.tensor(add_edges, device=device, dtype=torch.long).t()  # (2, M)
+                extra_ew = torch.ones(extra_ei.size(1), device=device, dtype=torch.float32)
+                ei_use = torch.cat([ei_base, extra_ei], dim=1)
+                ew_use = torch.cat([ew_use, extra_ew], dim=0)
+            else:
+                ei_use = ei_base
+
+            return ei_use, ew_use
+
+        # ---- adjacency list for k_hop mode (CPU side) ----
+        adj_list = None
+        if mode == "k_hop":
+            ei_cpu = ei_base.cpu()
+            adj_list = [[] for _ in range(n)]
+            src = ei_cpu[0].tolist()
+            dst = ei_cpu[1].tolist()
+            for u, v in zip(src, dst):
+                adj_list[u].append(v)
+
+        # -------- switch: sampling mode --------
+        if mode == "one_sample":
+            while (flips_done == 0 or flips_done < n_candidates_one_sample) and tries < max_sampling_tries:
+                u, v, action, k_lin = PRBCD._sample_one_flip(n, present, g, device)
+                tries += 1
+                if seen[k_lin]:
+                    continue
+                seen[k_lin] = True
+
+                batch = [(u, v, action, k_lin)]
+                ei_use, ew_use = _build_perturbed_adj(batch)
+
+                with torch.no_grad():
+                    logits_pert = self.attacked_model(data=self.attr.to(device), adj=(ei_use, ew_use))
+                    acc_pert = utils.accuracy(logits_pert, self.labels.to(device), self.idx_attack)
+
+                drop = float(acc_clean - acc_pert)
+                tried_set.add((int(k_lin), drop))
+
+                # record this pair as labeled (harmful or not)
+                lab_u.append(int(u))
+                lab_v.append(int(v))
+                lab_k.append(int(k_lin))
+
+                if drop > drop_threshold_one_sample:
+                    y_out[k_lin] = 1
+                    harmful_set.add((int(k_lin), drop))
+                    flips_done += 1
+
+        elif mode == "k_action":
+            while (flips_done == 0 or flips_done < n_candidates_k_sample) and tries < max_sampling_tries:
+                batch = PRBCD._sample_k_flips(
+                    n=n,
+                    present=present,
+                    g=g,
+                    device=device,
+                    k=int(k_samples_batch),
+                    seen=seen,
+                )
+                if not batch:
+                    break
+
+                for (u, v, _action, k_lin) in batch:
+                    seen[k_lin] = True
+                    tries += 1
+
+                ei_use, ew_use = _build_perturbed_adj(batch)
+
+                with torch.no_grad():
+                    logits_pert = self.attacked_model(data=self.attr.to(device), adj=(ei_use, ew_use))
+                    acc_pert = utils.accuracy(logits_pert, self.labels.to(device), self.idx_attack)
+
+                drop = float(acc_clean - acc_pert)
+
+                for (u, v, _action, k_lin) in batch:
+                    tried_set.add((int(k_lin), drop))
+
+                    # record as labeled
+                    lab_u.append(int(u))
+                    lab_v.append(int(v))
+                    lab_k.append(int(k_lin))
+
+                if drop > drop_threshold_k_samples:
+                    for (_u, _v, _action, k_lin) in batch:
+                        y_out[k_lin] = 1
+                        harmful_set.add((int(k_lin), drop))
+                    flips_done += len(batch)
+
+        elif mode == "k_hop":
+            if adj_list is None:
+                raise RuntimeError("adj_list must be built for k_hop mode.")
+
+            max_root_tries = 100_000
+
+            while (flips_done == 0 or flips_done < n_candidates_k_hop_sample) and tries < max_sampling_tries:
+                batch = PRBCD._sample_khop_flips(
+                    n=n,
+                    present=present,
+                    g=g,
+                    device=device,
+                    k_hop=k_hop,
+                    seen=seen,
+                    adj_list=adj_list,
+                    max_root_tries=max_root_tries,
+                )
+                if not batch:
+                    break
+
+                for (u, v, _action, k_lin) in batch:
+                    seen[k_lin] = True
+                    tries += 1
+
+                ei_use, ew_use = _build_perturbed_adj(batch)
+
+                with torch.no_grad():
+                    logits_pert = self.attacked_model(data=self.attr.to(device), adj=(ei_use, ew_use))
+                    acc_pert = utils.accuracy(logits_pert, self.labels.to(device), self.idx_attack)
+
+                drop = float(acc_clean - acc_pert)
+
+                for (u, v, _action, k_lin) in batch:
+                    tried_set.add((int(k_lin), drop))
+
+                    # record as labeled
+                    lab_u.append(int(u))
+                    lab_v.append(int(v))
+                    lab_k.append(int(k_lin))
+
+                if drop > drop_threshold_k_hop:
+                    for (_u, _v, _action, k_lin) in batch:
+                        y_out[k_lin] = 1
+                        harmful_set.add((int(k_lin), drop))
+                    flips_done += len(batch)
+
+            # enforce exact n_candidates_k_hop_sample harmful entries if we overshoot
+            if flips_done > n_candidates_k_hop_sample:
+                harmful_idx = torch.nonzero(y_out, as_tuple=False).flatten()
+                keep = harmful_idx[:n_candidates_k_hop_sample]
+                remove = harmful_idx[n_candidates_k_hop_sample:]
+
+                y_out[remove] = 0
+                keep_set = set(int(i.item()) for i in keep)
+                harmful_set = {(idx, drop) for (idx, drop) in harmful_set if idx in keep_set}
+                flips_done = n_candidates_k_hop_sample
+
+        else:
+            raise ValueError(f"Unknown mode '{mode}'. Use 'one_sample', 'k_action' or 'k_hop'.")
+
+
+        # ---- NEW: build edge_index_lab and y_label by picking lowest/highest drops ----
+        # create mapping from k_lin -> (u, v) for all actually evaluated pairs
+        k_to_uv = {k: (u, v) for u, v, k in zip(lab_u, lab_v, lab_k)}
+
+        if not tried_set or len(k_to_uv) == 0:
+            # nothing evaluated -> return empty label set
+            edge_index_lab = torch.empty((2, 0), device=device, dtype=torch.long)
+            y_label = torch.empty((0,), device=device, dtype=torch.uint8)
+            return y_out, edge_index_lab, y_label, tried_set, harmful_set
+
+        # sort tried_set by drop value (ascending: smallest drop first)
+        # tried_set: Set[(k_lin, drop)]
+        sorted_tried = sorted(tried_set, key=lambda t: t[1])  # (k_lin, drop)
+
+        # number of labeled pairs we want
+        M_target = int(n_candidates_k_sample)
+        K = min(len(sorted_tried), M_target)  # in case we have fewer tried than requested
+
+        if K == 0:
+            edge_index_lab = torch.empty((2, 0), device=device, dtype=torch.long)
+            y_label = torch.empty((0,), device=device, dtype=torch.uint8)
+            return y_out, edge_index_lab, y_label, tried_set, harmful_set
+
+        # split into low-drop and high-drop halves
+        # (if K is odd, low gets one more so that low+high=K)
+        half_high = K #TODO: change so that we can have all 2000 pos examples.
+        half_low = K
+
+        low_part = sorted_tried[:half_low]           # smallest drops
+        high_part = sorted_tried[-half_high:] if half_high > 0 else []  # largest drops
+
+        # construct edge_index_lab and y_label (0 for low, 1 for high)
+        sel_u = []
+        sel_v = []
+        sel_y = []
+
+        # low-drop → label 0
+        for k_lin, _drop in low_part:
+            if k_lin not in k_to_uv:
+                continue
+            u, v = k_to_uv[k_lin]
+            sel_u.append(u)
+            sel_v.append(v)
+            sel_y.append(0)
+
+        # high-drop → label 1
+        for k_lin, _drop in high_part:
+            if k_lin not in k_to_uv:
+                continue
+            u, v = k_to_uv[k_lin]
+            sel_u.append(u)
+            sel_v.append(v)
+            sel_y.append(1)
+
+        if len(sel_u) == 0:
+            edge_index_lab = torch.empty((2, 0), device=device, dtype=torch.long)
+            y_label = torch.empty((0,), device=device, dtype=torch.uint8)
+            return y_out, edge_index_lab, y_label, tried_set, harmful_set
+
+        u_tensor = torch.tensor(sel_u, device=device, dtype=torch.long)
+        v_tensor = torch.tensor(sel_v, device=device, dtype=torch.long)
+        edge_index_lab = torch.stack([u_tensor, v_tensor], dim=0)  # (2, M_sel)
+
+        y_label = torch.tensor(sel_y, device=device, dtype=torch.uint8)  # (M_sel,)
+
+        return y_out, edge_index_lab, y_label, tried_set, harmful_set
+
+    def label_edge_flips_prbcd_k_action(
+            self,
+            n_candidates_k_sample: int = 2000,
+            drop_threshold_k_samples: float = -1,
+            rng_seed: int = 0,
+            max_sampling_tries: int = 100_000,
+            k_samples_batch: int = 20,
+            prev_tried_set: "Set[tuple[int, float]] | None" = None,
+    ):
+        """
+        Reine k_action-Version von label_edge_flips_prbcd_selfsample_fast.
+        Führt Sampling von k-Flips gleichzeitig durch und evaluiert sie in einem Schritt.
+        """
+
+        import torch
+        from typing import Set, Tuple
+
+        device = getattr(self, "device", "cpu")
+
+        n: int = int(self.n)
+        if n <= 1:
+            raise ValueError("Graph must have at least 2 nodes.")
+
+        # ---- base adjacency
+        ei_base = self.edge_index.to(device=device, dtype=torch.long).contiguous()
+        ew_base = (self.edge_weight.to(device).float()
+                   if getattr(self, "edge_weight", None) is not None
+                   else torch.ones(ei_base.size(1), device=device, dtype=torch.float32)).contiguous()
+
+        # ---- undirected membership bitset
+        present = PRBCD._build_uppertri_bitset(ei_base, n)
+
+        E = ei_base.size(1)
+        dir_pos = torch.full((n, n), -1, dtype=torch.int32, device=device)
+        dir_pos[ei_base[0], ei_base[1]] = torch.arange(E, device=device, dtype=torch.int32)
+
+        # ---- clean accuracy
+        logits_clean = self.attacked_model(data=self.attr.to(device), adj=(ei_base, ew_base))
+        acc_clean = utils.accuracy(logits_clean, self.labels.to(device), self.idx_attack)
+
+        # ---- outputs
+        num_pairs = n * (n - 1) // 2
+        y_out = torch.zeros(num_pairs, dtype=torch.uint8, device=device)
+
+        tried_set: Set[Tuple[int, float]] = set(prev_tried_set) if prev_tried_set else set()
+        harmful_set: Set[Tuple[int, float]] = set()
+
+        # ---- seen mask
+        seen = torch.zeros(num_pairs, dtype=torch.bool, device=device)
+
+        if prev_tried_set:
+            prev_indices = [idx for (idx, _) in prev_tried_set if 0 <= idx < num_pairs]
+            if prev_indices:
+                seen[torch.tensor(prev_indices, device=device, dtype=torch.long)] = True
+
+        # RNG
+        g = torch.Generator(device=device)
+        g.manual_seed(int(rng_seed))
+
         flips_done = 0
         tries = 0
-        seen_lin: Set[int] = set()
 
-        while (flips_done == 0 or flips_done < n_candidates) and tries < max_sampling_tries:
-            cand = self.acc_sampler_sample_one_edge(
-                p_add=p_add, p_del=p_del,
-                rng_seed=int(rng.integers(0, 2 ** 31 - 1))
+        # --- helper
+        def _build_perturbed_adj(flips):
+            ew_use = ew_base.clone()
+            del_indices = []
+            add_edges = []
+
+            for (u, v, action, _) in flips:
+                if action == "del":
+                    idx1 = int(dir_pos[u, v])
+                    if idx1 >= 0:
+                        del_indices.append(idx1)
+                    idx2 = int(dir_pos[v, u])
+                    if idx2 >= 0:
+                        del_indices.append(idx2)
+                else:  # add
+                    add_edges.append((u, v))
+                    add_edges.append((v, u))
+
+            if del_indices:
+                ew_use[torch.tensor(del_indices, device=device)] = 0.0
+
+            if add_edges:
+                extra_ei = torch.tensor(add_edges, device=device).t()
+                extra_ew = torch.ones(extra_ei.size(1), device=device)
+                ei_use = torch.cat([ei_base, extra_ei], dim=1)
+                ew_use = torch.cat([ew_use, extra_ew], dim=0)
+            else:
+                ei_use = ei_base
+
+            return ei_use, ew_use
+
+        # ---- k_action loop ----
+        while (flips_done == 0 or flips_done < n_candidates_k_sample) and tries < max_sampling_tries:
+
+            batch = PRBCD._sample_k_flips(
+                n=n,
+                present=present,
+                g=g,
+                device=device,
+                k=int(k_samples_batch),
+                seen=seen,
             )
-            tries += 1
-            if not cand:
-                continue
+            if not batch:
+                break
 
-            u, v, action = cand[0]
-            u = int(u)
-            v = int(v)
-            lin = lin_idx_for_pair(u, v)
-            if lin in seen_lin:
-                continue
-            seen_lin.add(lin)
+            for (_, _, _, k_lin) in batch:
+                seen[k_lin] = True
+                tries += 1
 
-            # --- Build perturbed adjacency quickly (no coalesce)
-            pert_ei = ei_base
-            pert_ew = ew_base.clone()  # small vector clone
+            ei_use, ew_use = _build_perturbed_adj(batch)
 
-            if action == "del":
-                # zero out directed (u,v); and (v,u) if undirected
-                idx = dir_map.get((u, v), None)
-                if idx is not None:
-                    pert_ew[idx] = 0.0
-                if undirected:
-                    idx2 = dir_map.get((v, u), None)
-                    if idx2 is not None:
-                        pert_ew[idx2] = 0.0
-
-            else:  # "add"
-                if undirected:
-                    if (min(u, v), max(u, v)) not in und_set:
-                        add_ei = torch.tensor([[u, v], [v, u]], dtype=torch.long, device=device)
-                        add_ew = torch.tensor([1.0, 1.0], dtype=torch.float32, device=device)
-                        pert_ei = torch.cat([ei_base, add_ei], dim=1)
-                        pert_ew = torch.cat([pert_ew, add_ew], dim=0)
-                else:
-                    if (u, v) not in dir_map:
-                        add_ei = torch.tensor([[u], [v]], dtype=torch.long, device=device)
-                        add_ew = torch.tensor([1.0], dtype=torch.float32, device=device)
-                        pert_ei = torch.cat([ei_base, add_ei], dim=1)
-                        pert_ew = torch.cat([pert_ew, add_ew], dim=0)
-
-            # --- Forward & label
             with torch.no_grad():
-                logits_pert = self.attacked_model(data=self.attr.to(device), adj=(pert_ei, pert_ew))
-                acc_pert = utils.accuracy(logits_pert, self.labels.to(device), self.idx_attack)
+                logits = self.attacked_model(
+                    data=self.attr.to(device),
+                    adj=(ei_use, ew_use)
+                )
+                acc_pert = utils.accuracy(logits, self.labels.to(device), self.idx_attack)
 
             drop = float(acc_clean - acc_pert)
-            tried_set.add((lin, drop))
-            if drop > drop_threshold:
-                y_out[lin] = 1
-                harmful_set.add((lin, drop))
-                flips_done += 1
+
+            # record in tried_set
+            for (_, _, _, k_lin) in batch:
+                tried_set.add((int(k_lin), drop))
+
+            if drop > drop_threshold_k_samples:
+                for (_, _, _, k_lin) in batch:
+                    y_out[k_lin] = 1
+                    harmful_set.add((int(k_lin), drop))
+                flips_done += len(batch)
 
         return y_out, tried_set, harmful_set
+
+    # ---------- fast membership over upper triangle ----------
+    def _build_uppertri_bitset(edge_index: torch.Tensor, n: int) -> torch.Tensor:
+        """
+        Returns a boolean vector 'present' of length num_pairs = n*(n-1)//2.
+        present[k] = True iff the undirected pair for linear index k exists (u<v).
+        """
+        num_pairs = n * (n - 1) // 2
+        if num_pairs == 0:
+            return torch.zeros(0, dtype=torch.bool, device=edge_index.device)
+        lin = PRBCD.pairs_to_linear_uppertri(edge_index, n)  # (E',)
+        if lin.numel() > 0:
+            lin = torch.unique(lin, sorted=False)
+        present = torch.zeros(num_pairs, dtype=torch.bool, device=edge_index.device)
+        if lin.numel() > 0:
+            present[lin] = True
+        return present
+
+    # ---------- tried_set to seen converter (for resampling) ----------
+    @staticmethod
+    def apply_tried_set_to_seen(seen: torch.Tensor, tried_set: set):
+        """
+        Mark all entries in `seen` that appear in `tried_set`.
+
+        Parameters
+        ----------
+        seen : torch.Tensor
+            A boolean tensor of shape (num_pairs,) tracking which linearized pairs
+            have already been sampled.
+        tried_set : set[tuple[int, float]]
+            Python set of (k_lin, drop) entries for every evaluated candidate.
+
+        Returns
+        -------
+        torch.Tensor
+            The updated boolean `seen` tensor.
+        """
+        if not tried_set:
+            return seen
+
+        # Extract all linear indices that were tried
+        tried_indices = [idx for (idx, _drop) in tried_set]
+
+        # Convert to tensor on same device as `seen`
+        tried_tensor = torch.tensor(
+            tried_indices, device=seen.device, dtype=torch.long
+        )
+
+        # Mark them as seen
+        seen[tried_tensor] = True
+        return seen
+
+    # ---------- single-sample sampler (no batching, torch-only) ----------
+    def _sample_one_flip(n: int, present: torch.Tensor, g: torch.Generator, device: torch.device) -> Tuple[
+        int, int, str, int]:
+        """
+        Sample exactly one unordered pair (u<v) uniformly from all C(n,2) pairs.
+        Decide 'del' if present[k] else 'add'. Returns (u, v, action, k).
+        """
+        num_pairs = n * (n - 1) // 2
+        k = int(torch.randint(num_pairs, (1,), generator=g, device=device).item())
+        uv = PRBCD.linear_to_triu_idx(n, torch.tensor([k], device=device))  # (2,1)
+        u = int(uv[0, 0].item())
+        v = int(uv[1, 0].item())
+        action = "del" if present[k].item() else "add"
+        return u, v, action, k
+
+    @staticmethod
+    def _sample_k_flips(n: int,
+                        present: torch.Tensor,
+                        g: torch.Generator,
+                        device: torch.device,
+                        *,
+                        k: int,
+                        seen: torch.Tensor) -> list[tuple[int, int, str, int]]:
+        """
+        Sample up to k DISTINCT unseen undirected pairs (by linear index over the upper triangle).
+        For each pair, action = 'del' if present, else 'add'.
+        Returns list of (u, v, action, k_lin).
+        """
+        num_pairs = int(n * (n - 1) // 2)
+        if num_pairs <= 0:
+            return []
+
+        # candidates mask: not seen
+        mask = (~seen).nonzero(as_tuple=False).flatten()
+        if mask.numel() == 0:
+            return []
+
+        # pick up to k random indices from remaining
+        if mask.numel() <= k:
+            pick = mask
+        else:
+            perm = torch.randperm(mask.numel(), device=device, generator=g)
+            pick = mask[perm[:k]]
+
+        # map linear -> (u,v) with u<v
+        uv = PRBCD.linear_to_triu_idx(n, pick.long())  # shape (2, m)
+        u = uv[0].to(torch.int64)
+        v = uv[1].to(torch.int64)
+
+        # decide actions from 'present' bitset
+        chosen_present = present[pick]  # bool
+        actions = ["del" if bool(x) else "add" for x in chosen_present.tolist()]
+
+        # build output list
+        out: list[tuple[int, int, str, int]] = []
+        for i in range(pick.numel()):
+            out.append((int(u[i].item()), int(v[i].item()), actions[i], int(pick[i].item())))
+        return out
+
+    @staticmethod
+    def _sample_khop_flips(
+            n: int,
+            present: torch.Tensor,
+            g: torch.Generator,
+            device: torch.device,
+            *,
+            k_hop: int,
+            seen: torch.Tensor,
+            adj_list: list[list[int]],
+            max_root_tries: int = 10,
+    ) -> list[tuple[int, int, str, int]]:
+        """
+        Sample ALL DISTINCT unseen undirected pairs inside the k-hop neighborhood of
+        a randomly chosen center node.
+
+        Returns list[(u, v, action, k_lin)].
+
+        - Center node is chosen uniformly at random from {0, ..., n-1}, up to
+          `max_root_tries` attempts to find one whose neighborhood yields at least
+          one unseen pair.
+        - k_hop >= 1.
+        """
+        import torch
+        from collections import deque
+
+        num_pairs_total = int(n * (n - 1) // 2)
+        if num_pairs_total <= 0 or k_hop <= 0:
+            return []
+
+        for _ in range(max_root_tries):
+            # 1) pick random center node
+            center = int(torch.randint(n, (1,), generator=g, device=device).item())
+
+            # 2) BFS up to depth k_hop to get node set N_k(center)
+            visited = set([center])
+            q = deque([(center, 0)])
+            while q:
+                node, dist = q.popleft()
+                if dist >= k_hop:
+                    continue
+                for nb in adj_list[node]:
+                    if nb not in visited:
+                        visited.add(nb)
+                        q.append((nb, dist + 1))
+
+            if len(visited) <= 1:
+                # no pairs here, continue
+                continue
+
+            nodes = sorted(visited)
+
+            # 3) enumerate all unordered node pairs in this neighborhood (u < v)
+            us = []
+            vs = []
+            for i in range(len(nodes)):
+                u = nodes[i]
+                for j in range(i + 1, len(nodes)):
+                    v = nodes[j]
+                    us.append(u)
+                    vs.append(v)
+
+            if not us:
+                continue
+
+            # 4) map (u, v) -> linear indices over upper triangle
+            pair_ei = torch.stack(
+                [
+                    torch.tensor(us, dtype=torch.long, device=device),
+                    torch.tensor(vs, dtype=torch.long, device=device),
+                ],
+                dim=0,
+            )  # shape (2, m)
+
+            k_lin_all = PRBCD.pairs_to_linear_uppertri(pair_ei, n).long()  # (m,)
+
+            # 5) keep only unseen pairs
+            unseen_mask = (~seen[k_lin_all]).nonzero(as_tuple=False).flatten()
+            if unseen_mask.numel() == 0:
+                continue
+
+            k_lin = k_lin_all[unseen_mask]
+            u_sel = pair_ei[0, unseen_mask]
+            v_sel = pair_ei[1, unseen_mask]
+
+            # 6) decide actions from 'present' bitset
+            chosen_present = present[k_lin]  # bool
+            actions = ["del" if bool(x) else "add" for x in chosen_present.tolist()]
+
+            # 7) build output list
+            out: list[tuple[int, int, str, int]] = []
+            for i in range(k_lin.numel()):
+                out.append(
+                    (
+                        int(u_sel[i].item()),
+                        int(v_sel[i].item()),
+                        actions[i],
+                        int(k_lin[i].item()),
+                    )
+                )
+
+            return out
+
+        # if we get here, no suitable center found within max_root_tries
+        return []
 
     def acc_sampler_sample_one_edge(
             self,
             p_add: float = 0.1,
             p_del: float = 0.06,
-            rng_seed: Optional[int] = None
+            rng_seed: Optional[int] = None,
+            *,
+            existing_set: Set[Tuple[int, int]],
+            N: int,
     ) -> List[Tuple[int, int, str]]:
         """
         Keep sampling one random unordered node pair (u,v) until a flip is accepted.
-        If (u,v) exists -> delete with prob p_del.
-        If it does not exist -> add with prob p_add.
+        Uses the precomputed undirected membership 'existing_set' and node count N.
         Returns exactly one candidate: [(u,v,'add'|'del')].
         """
         import numpy as np
 
-        # collect existing edges (undirected)
-        edge_index_cpu = self.edge_index.cpu()
-        u_arr = edge_index_cpu[0].numpy().astype(int)
-        v_arr = edge_index_cpu[1].numpy().astype(int)
-        existing_set = {(min(a, b), max(a, b)) for a, b in zip(u_arr, v_arr) if a != b}
-
-        N = int(getattr(self, "n", None))
         if N is None or N <= 1:
             raise ValueError("acc_sampler_sample_one_edge: graph must have at least 2 nodes.")
 
-        # quick feasibility checks to avoid infinite loops
+        # feasibility once (no rebuilding)
         num_pairs = N * (N - 1) // 2
         num_edges = len(existing_set)
         num_non_edges = num_pairs - num_edges
@@ -2617,10 +3375,40 @@ class PRBCD(SparseAttack):
 
             is_edge = (u, v) in existing_set
             prob = p_del if is_edge else p_add
-
             if rng.random() < prob:
                 action = "del" if is_edge else "add"
                 return [(u, v, action)]
+
+    def acc_sampler_flip_one_edge_simple(
+            self,
+            *,
+            existing_set: Set[Tuple[int, int]],
+            N: int,
+            rng_seed: Optional[int] = None,
+    ) -> Tuple[int, int, str]:
+        """
+        Pick exactly one random unordered node pair (u,v) uniformly (u < v) and flip its state.
+        Returns (u, v, 'add' | 'del').
+        """
+        import numpy as np
+        import math
+
+        if N is None or N <= 1:
+            raise ValueError("flip_one_edge: graph must have at least 2 nodes.")
+
+        rng = np.random.default_rng(rng_seed)
+
+        # Sample a single index in [0, C(N,2))
+        num_pairs = N * (N - 1) // 2
+        t = int(rng.integers(0, num_pairs))
+
+        disc = (2 * N - 1) ** 2 - 8 * t
+        u = int((2 * N - 1 - math.isqrt(disc)) // 2)
+        off_u = u * (2 * N - u - 1) // 2
+        v = u + 1 + (t - off_u)
+
+        action = "del" if (u, v) in existing_set else "add"
+        return (u, v, action)
 
     def _make_margin_labels(self):
         with torch.no_grad():
@@ -2668,6 +3456,129 @@ class PRBCD(SparseAttack):
         self.selector.eval()
         self._margin_trained = True
         logging.info("[Selector] Pretraining finished.")
+
+    def train_link_prediction_gnn(
+            self,
+            x: torch.Tensor,
+            edge_index_struct: torch.Tensor,
+            edge_index_lab: torch.Tensor,
+            y_label: torch.Tensor,
+            device: str = "cpu",
+            num_epochs: int = 200,
+            hidden_dim: int = 64,
+            out_dim: int = 64,
+            lr: float = 1e-3,
+            weight_decay: float = 5e-4,
+            use_tqdm: bool = True,
+            verbose: bool = True,
+    ):
+        """
+        Train a link prediction GNN on labeled edge pairs with detailed logging.
+
+        Returns:
+            model: trained LinkPredictionGNN
+        """
+
+        x = x.to(device)
+        edge_index_struct = edge_index_struct.to(device)
+        edge_index_lab = edge_index_lab.to(device)
+        y_label = y_label.float().to(device)
+
+        M = edge_index_lab.size(1)
+        if M == 0:
+            print("[LP-GNN] No labeled pairs. Returning untrained model.")
+            model = LinkPredictionGNN(
+                in_dim=x.size(1),
+                hidden_dim=hidden_dim,
+                out_dim=out_dim,
+            ).to(device)
+            return model
+
+        # ---- train/val split (stratified 50/50, negatives first half, positives second half) ----
+        M = edge_index_lab.size(1)
+        assert M == y_label.numel(), "edge_index_lab and y_label must have the same number of examples"
+        assert M % 2 == 0, "Expected equal number of negatives/positives (M must be even)."
+
+        half = M // 2
+        neg_idx_all = torch.arange(0, half, device=device)
+        pos_idx_all = torch.arange(half, M, device=device)
+
+        # shuffle within each class
+        neg_perm = neg_idx_all[torch.randperm(half, device=device)]
+        pos_perm = pos_idx_all[torch.randperm(half, device=device)]
+
+        train_size_per_class = int(0.8 * half)
+
+        train_idx = torch.cat([neg_perm[:train_size_per_class], pos_perm[:train_size_per_class]], dim=0)
+        val_idx = torch.cat([neg_perm[train_size_per_class:], pos_perm[train_size_per_class:]], dim=0)
+
+        # optional: shuffle final indices so batches aren't class-blocked
+        train_idx = train_idx[torch.randperm(train_idx.numel(), device=device)]
+        val_idx = val_idx[torch.randperm(val_idx.numel(), device=device)]
+
+        if verbose:
+            print(f"[LP-GNN] Total labeled pairs: {M}")
+            print(f"[LP-GNN] Train pairs: {train_size_per_class}, Val pairs: {M - train_size_per_class}")
+
+        # ---- Define model ----
+        model = LinkPredictionGNN(
+            in_dim=x.size(1),
+            hidden_dim=hidden_dim,
+            out_dim=out_dim,
+        ).to(device)
+
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=lr,
+            weight_decay=weight_decay,
+        )
+        loss_fn = nn.BCEWithLogitsLoss()
+
+        # progress bar
+        epoch_iter = tqdm(range(num_epochs), desc="[LP-GNN] Training") if use_tqdm else range(num_epochs)
+
+        # ---- Training Loop ----
+        for epoch in epoch_iter:
+            model.train()
+            optimizer.zero_grad()
+
+            logits_train = model(x, edge_index_struct, edge_index_lab[:, train_idx])
+            loss = loss_fn(logits_train.view(-1), y_label[train_idx])
+            loss.backward()
+            optimizer.step()
+
+            # ---- Validation ----
+            model.eval()
+            with torch.no_grad():
+                logits_val = model(x, edge_index_struct, edge_index_lab[:, val_idx])
+                val_loss = loss_fn(logits_val.view(-1), y_label[val_idx])
+
+                probs_val = torch.sigmoid(logits_val.view(-1))
+                preds_val = (probs_val >= 0.5).long()
+                acc_val = (preds_val == y_label[val_idx].long()).float().mean()
+
+            # update tqdm bar text
+            if use_tqdm:
+                epoch_iter.set_postfix({
+                    "train_loss": f"{loss.item():.4f}",
+                    "val_loss": f"{val_loss.item():.4f}",
+                    "val_acc": f"{acc_val.item():.4f}"
+                })
+
+            # print verbose log every N epochs
+            if verbose and ((epoch + 1) % 20 == 0 or epoch == 0):
+                print(
+                    f"[LP-GNN] Epoch {epoch + 1:03d}/{num_epochs} | "
+                    f"Train Loss={loss.item():.4f} | "
+                    f"Val Loss={val_loss.item():.4f} | "
+                    f"Val Acc={acc_val.item():.4f}"
+                )
+
+        if verbose:
+            print("\n[LP-GNN] Training complete.")
+            print(f"[LP-GNN] Final Val Loss={val_loss.item():.4f}, Val Acc={acc_val.item():.4f}")
+
+        return model
 
     def _pretrain_pregnn_linkpred(
             self,
@@ -3005,6 +3916,64 @@ class PRBCD(SparseAttack):
         self.attack_statistics['nonzero_weights'].append((self.perturbed_edge_weight > self.eps).sum().item())
         self.attack_statistics['probability_mass_update'].append(probability_mass_update)
         self.attack_statistics['probability_mass_projected'].append(probability_mass_projected)
+
+    def extract_X_and_edge_index_from_sparsegraph(self, graph):
+        N, d = graph.attr_matrix.shape
+
+        # ---- Features X: (N, d) dense ----
+        X_coo = graph.attr_matrix.tocoo()
+        X_idx = torch.tensor(
+            np.vstack([X_coo.row, X_coo.col]),
+            dtype=torch.long,
+            device=self.device,
+        )
+        X_val = torch.tensor(X_coo.data, dtype=torch.float32, device=self.device)
+        X_sparse = torch.sparse_coo_tensor(
+            X_idx, X_val, size=(N, d), device=self.device
+        ).coalesce()
+        X = X_sparse.to_dense()  # (N, d)
+
+        # ---- Adjacency A → edge_index_struct: (2, E) ----
+        A_coo = graph.adj_matrix.tocoo()
+        A_idx = torch.tensor(
+            np.vstack([A_coo.row, A_coo.col]),
+            dtype=torch.long,
+            device=self.device,
+        )
+        A_val = torch.tensor(A_coo.data, dtype=torch.float32, device=self.device)
+        A_sparse = torch.sparse_coo_tensor(
+            A_idx, A_val, size=(N, N), device=self.device
+        ).coalesce()
+
+        edge_index_struct = A_sparse.indices()  # (2, E)
+        # optionally remove self-loops:
+        # edge_index_struct = PRBCD.cut_diagonal_entries(edge_index_struct)
+
+        return X, edge_index_struct
+
+    @staticmethod
+    def save_selection(path, y_out, edge_index_lab, y_label, tried_set, harmful_set, meta=None):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        payload = {
+            "y_out": y_out.detach().cpu() if torch.is_tensor(y_out) else y_out,
+            "edge_index_lab": edge_index_lab.detach().cpu(),
+            "y_label": y_label.detach().cpu(),
+            "tried_set": tried_set,
+            "harmful_set": harmful_set,
+            "meta": meta or {},
+        }
+        torch.save(payload, path)
+
+    @staticmethod
+    def load_selection(path, device="cpu"):
+        payload = torch.load(path, map_location="cpu")
+        # move tensors back to device
+        y_out = payload["y_out"]
+        if torch.is_tensor(y_out):
+            y_out = y_out.to(device)
+        edge_index_lab = payload["edge_index_lab"].to(device)
+        y_label = payload["y_label"].to(device)
+        return y_out, edge_index_lab, y_label, payload["tried_set"], payload["harmful_set"], payload.get("meta", {})
 
     @staticmethod
     def cut_matrix_idx_to_triu_idx(matrix: torch.tensor) -> torch.Tensor:

@@ -60,7 +60,7 @@ def config():
     debug_level = "info"
 
 @ex.automain
-def run(graph, data_dir: str, dataset: str, attack: str, attack_params: Dict[str, Any], epsilons: Sequence[float],
+def run(ads_mode, graph, data_dir: str, dataset: str, attack: str, attack_params: Dict[str, Any], epsilons: Sequence[float],
         binary_attr: bool, make_undirected: bool, seed: int, artifact_dir: str, pert_adj_storage_type: str,
         pert_attr_storage_type: str, model_label: str, model_storage_type: str, device: Union[str, int],
         data_device: Union[str, int], debug_level: str, semi: bool, use_cert: str = "none",
@@ -110,7 +110,7 @@ def run(graph, data_dir: str, dataset: str, attack: str, attack_params: Dict[str
 
         for epsilon in epsilons:
             # run the attack (may load from cache or actually optimize)
-            gradient = run_global_attack(graph=graph,
+            gradient = run_global_attack(ads_mode=ads_mode,graph=graph,
                 epsilon=epsilon, m=m, storage=storage, pert_adj_storage_type=pert_adj_storage_type, pert_attr_storage_type=pert_attr_storage_type,
                 pert_params=pert_params, adversary=adversary, model_label=model_label, semi=semi, use_cert=use_cert,
                 grid_radii=grid_radii, grid_binary_class=grid_binary_class
