@@ -59,7 +59,7 @@ greedy_rbcd:
 prbcd:
   fixed:
     binary_attr: False
-    attack: PRBCD
+    attack: CertificateAttack
     attack_params:
       epochs: 500
       fine_tune_epochs: 100

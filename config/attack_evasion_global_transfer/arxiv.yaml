@@ -45,7 +45,7 @@ greedy_rbcd:
 
 prbcd:
   fixed:
-    attack: PRBCD
+    attack: CertificateAttack
     binary_attr: False
     surrogate_model_label: Vanilla GCN
     attack_params:

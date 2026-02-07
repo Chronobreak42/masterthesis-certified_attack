@@ -18,7 +18,7 @@ from rgnn_at_scale.attacks.prbcd_sampling_modification import PRBCDSamplingModif
 from rgnn_at_scale.helper import utils
 
 
-class PRBCD(SparseAttack):
+class CertificateAttack(SparseAttack):
     """Sampled and hence scalable PGD attack for graph data.
     """
 
@@ -111,54 +111,13 @@ class PRBCD(SparseAttack):
             f'The search space size ({self.block_size}) must be ' \
             + f'greater than the number of permutations ({n_perturbations})'
 
-        # For early stopping (not explicitly covered by pesudo code)
-        best_accuracy = float('Inf')
-        best_epoch = float('-Inf')
-
-        # For collecting attack statistics
-        self.attack_statistics = defaultdict(list)
-
-        # Sample initial search space (Algorithm 1, line 3-4)
-        if replace_sampling_method:
-            # old methods:
-            if method_to_use in ("sampling_grid_radii",
-                                 "sampling_grid_radii_alt_11",
-                                 "both_1", "both_2_random",
-                                 "sampling_grid_binary_class",
-                                 "sampling_grid_binary_class_alt_11",
-                                 "both_2", "low_certificate_values", "high_certificate_values"):
-                print(method_to_use, "SAMPLING with old methods")
-                self.sample_block_use_cert(grid_radii=self.grid_radii, grid_binary_class=self.grid_binary_class,
-                                           n_perturbations=n_perturbations)
-
-            else:
-                print("---------SAMPLING---------", method_to_use)
-                unique_grids, counts = np.unique(self.grid_binary_class, axis=0, return_counts=True)
-                print("Number of different certificate grids in grid_binary_class:", unique_grids.shape[0])
-
-                self.sample_block_with_new_method(grid_radii=self.grid_radii,
-                                                  n_perturbations=n_perturbations)
-        else:
-            print(method_to_use, "run SAMPLING with standard random approach")
-            self.sample_random_block(n_perturbations)
-
-        # Accuracy and attack statistics before the attack even started
-        with torch.no_grad():
-            logits = self._get_logits(self.attr, self.edge_index, self.edge_weight)
-            loss = self.calculate_loss(logits[self.idx_attack], self.labels[self.idx_attack])
-            accuracy = utils.accuracy(logits, self.labels, self.idx_attack)
-
-            logging.info(f'\nBefore the attack - Loss: {loss.item()} Accuracy: {100 * accuracy:.3f} %\n')
-
-            self._append_attack_statistics(loss.item(), accuracy, 0., 0.)
-
-            del logits, loss
-
+        '''
         # Loop over the epochs (Algorithm 1, line 5)
         for epoch in tqdm(range(self.epochs)):
             self.perturbed_edge_weight.requires_grad = True
 
             # Retreive sparse perturbed adjacency matrix `A \oplus p_{t-1}` (Algorithm 1, line 6)
+            # TODO: change get_modified_adj
             edge_index, edge_weight = self.get_modified_adj()
 
             if torch.cuda.is_available() and self.do_synchronize:
@@ -182,12 +141,14 @@ class PRBCD(SparseAttack):
                 # For monitoring
                 probability_mass_update = self.perturbed_edge_weight.sum().item()
                 # Projection to stay within relaxed `L_0` budget (Algorithm 1, line 8)
+                # TODO: Projection nicht unbedingt notwendig
                 self.perturbed_edge_weight = Attack.project(
                     n_perturbations, self.perturbed_edge_weight, self.eps)
                 # For monitoring
                 probability_mass_projected = self.perturbed_edge_weight.sum().item()
 
                 # Calculate accuracy after the current epoch (overhead for monitoring and early stopping)
+                # TODO: change get_modified_adj
                 edge_index, edge_weight = self.get_modified_adj()
                 logits = self.attacked_model(data=self.attr.to(self.device), adj=(edge_index, edge_weight))
                 accuracy = utils.accuracy(logits, self.labels, self.idx_attack)
@@ -209,7 +170,7 @@ class PRBCD(SparseAttack):
                 # Resampling of search space (Algorithm 1, line 9-14)
                 if epoch < self.epochs_resampling - 1:
                     renew_certificate = False
-                    if ((epoch + 1) % 10 == 0) and self.method not in ("standard-PRBCD",) and renew_certificate:
+                    if ((epoch + 1) % 10 == 0) and self.method not in ("standard-CertificateAttack",) and renew_certificate:
                         # TODO: use get_modified_adj()
                         certificatehelper.overwriteModel(self.perturbed_edge_weight)
                         print("Compute New Certificate")
@@ -250,28 +211,215 @@ class PRBCD(SparseAttack):
                     self.modified_edge_index = best_edge_index.to(self.device)
                     self.perturbed_edge_weight = best_edge_weight_diff.to(self.device)
                     self.perturbed_edge_weight.requires_grad = True
+        '''
 
         # Retreive best epoch if early stopping is active (not explicitly covered by pesudo code)
-        if self.with_early_stopping:
-            self.current_search_space = best_search_space.to(self.device)
-            self.modified_edge_index = best_edge_index.to(self.device)
-            self.perturbed_edge_weight = best_edge_weight_diff.to(self.device)
+        # if self.with_early_stopping:
+        #    self.current_search_space = best_search_space.to(self.device)
+        #    self.modified_edge_index = best_edge_index.to(self.device)
+        #    self.perturbed_edge_weight = best_edge_weight_diff.to(self.device)
 
         # Sample final discrete graph (Algorithm 1, line 16)
-        edge_index = self.sample_final_edges(n_perturbations)[0]
+
+        # For early stopping (not explicitly covered by pesudo code)
+        best_accuracy = float('Inf')
+        best_epoch = float('-Inf')
+
+        # For collecting attack statistics
+        self.attack_statistics = defaultdict(list)
+        if self.method_for_target_nodes_1 == Method.STANDARD:
+            self.sample_random_block(n_perturbations)
+        else:
+            edges_to_attack = torch.empty((2, 0), dtype=torch.long)
+            self.current_search_space, self.modified_edge_index = self.get_edges_to_attack(n_perturbations,
+                                                                                           edges_to_attack)
+            while self.current_search_space.size(dim=0) < n_perturbations:
+                # TODO: Teste hier das Ziehen von n_perturbations vielen samples und das droppen von zu vielen einträgen
+                # TODO: Außerdem überlege schlaue zieh patterns
+                self.current_search_space, self.modified_edge_index = self.get_edges_to_attack(
+                                                                                n_perturbations,
+                                                                                self.modified_edge_index)
+                if self.current_search_space.size(dim=0) > n_perturbations:
+                    self.current_search_space = self.current_search_space[:n_perturbations]
+        self.perturbed_edge_weight = torch.ones_like(self.current_search_space, dtype=torch.float32)
+        # Accuracy and attack statistics before the attack even started
+        with torch.no_grad():
+
+            logits = self._get_logits(self.attr, self.edge_index, self.edge_weight)
+            loss = self.calculate_loss(logits[self.idx_attack], self.labels[self.idx_attack])
+            accuracy = utils.accuracy(logits, self.labels, self.idx_attack)
+
+            logging.info(f'\nBefore the attack - Loss: {loss.item()} Accuracy: {100 * accuracy:.3f} %\n')
+
+            self._append_attack_statistics(loss.item(), accuracy, 0., 0.)
+
+            del logits, loss
+
+        #self.edge_index = self.addXOR(self.edge_index, self.modified_edge_index)
+        # self.apply_edge_toggles(self.modified_edge_index)
+        #self.edge_weight = torch.ones_like(self.edge_index[0], dtype=torch.float32)
+        self.edge_index, self.edge_weight = self.get_modified_adj()
+        self.attr_adversary = self.attr
+
+        with torch.no_grad():
+
+            logits = self._get_logits(self.attr, self.edge_index, self.edge_weight)
+            loss = self.calculate_loss(logits[self.idx_attack], self.labels[self.idx_attack])
+            accuracy = utils.accuracy(logits, self.labels, self.idx_attack)
+            del logits
+            self._append_attack_statistics(loss, accuracy, 0, 0)
+        ###
 
         self.adj_adversary = SparseTensor.from_edge_index(
-            edge_index,
-            torch.ones_like(edge_index[0], dtype=torch.float32),
+            self.edge_index,
+            torch.ones_like(self.edge_index[0], dtype=torch.float32),
             (self.n, self.n)
         ).coalesce().detach()
         self.attr_adversary = self.attr
 
         # TODO: Don't we want to switch to returning things? Haha yeah me too
 
+    def addXOR(self, edge_index, modified_edge_index):
+        '''
+        edge_index_sparse = SparseTensor.from_edge_index(
+            edge_index,
+            torch.ones_like(edge_index[0], dtype=torch.float32),
+            (self.n, self.n)
+        )
+
+        modified_edge_index_sparse = SparseTensor.from_edge_index(
+            modified_edge_index,
+            torch.ones_like(modified_edge_index[0], dtype=torch.float32),
+            (self.n, self.n)
+        )
+
+        summed_sparse = edge_index_sparse + modified_edge_index_sparse
+
+
+        mask_index_duplicate_entry_clean = torch.ones(edge_index.size(1), dtype=torch.long)
+        mask_index_duplicate_entry_modified = torch.ones(modified_edge_index.size(1), dtype=torch.long)
+        index_duplicate_entry_clean = torch.empty(1, dtype=torch.long)
+        index_duplicate_entry_modified = torch.empty(1, dtype=torch.long)
+
+        for clean_edge_i in range(edge_index.shape[1]):
+            for modified_edge_j in range(modified_edge_index.shape[1]):
+                if (edge_index[:, clean_edge_i][0] == modified_edge_index[:, modified_edge_j][0] and
+                        edge_index[:, clean_edge_i][1] == modified_edge_index[:, modified_edge_j][1]):
+                    index_duplicate_entry_clean = torch.cat([index_duplicate_entry_clean, clean_edge_i], dim=0)
+                    index_duplicate_entry_modified = torch.cat([index_duplicate_entry_modified, modified_edge_j], dim=0)
+
+        mask_index_duplicate_entry_clean[index_duplicate_entry_clean] = 0
+        mask_index_duplicate_entry_modified[index_duplicate_entry_modified] = 0
+
+        new_edges = torch.cat(
+            [edge_index[mask_index_duplicate_entry_clean],
+             modified_edge_index[mask_index_duplicate_entry_modified]],
+            dim=1)
+
+        return new_edges
+        '''
+        e1 = edge_index.t()
+        e2 = modified_edge_index.t()
+
+        # Convert edges to tuples via hashing
+        e1_set = {tuple(e.tolist()) for e in e1}
+        e2_set = {tuple(e.tolist()) for e in e2}
+
+        xor_set = e1_set ^ e2_set  # symmetric difference
+
+        xor_edges = torch.tensor(list(xor_set), dtype=edge_index.dtype)
+        return xor_edges.t()
+
+    def apply_edge_toggles(self, perturbed_edges: torch.Tensor):
+        """
+        Toggles edges in self.edge_index using perturbed_edges.
+
+        If an edge exists → remove it
+        If it does not exist → add it
+
+        perturbed_edges: (2, P)
+        """
+
+        # Canonicalize both
+        edge_idx = self._canonicalize_edges(self.edge_index)
+        perturbed_edges = self._canonicalize_edges(perturbed_edges)
+
+        # Convert to set of tuples (CPU for hashing)
+        edge_set = {
+            (int(u), int(v)) for u, v in edge_idx.t().cpu().tolist()
+        }
+
+        for u, v in perturbed_edges.t().cpu().tolist():
+            key = (int(u), int(v))
+            if key in edge_set:
+                edge_set.remove(key)  # remove existing edge
+            else:
+                edge_set.add(key)  # add new edge
+
+        if len(edge_set) == 0:
+            raise RuntimeError("All edges removed – graph became empty.")
+
+        # Rebuild edge_idx
+        new_edge_idx = torch.tensor(
+            list(edge_set),
+            device=self.edge_index.device,
+            dtype=torch.long
+        ).t().contiguous()
+
+        self.edge_index = new_edge_idx
+
+    def _canonicalize_edges(self, edge_index: torch.Tensor) -> torch.Tensor:
+        """
+        Ensures a canonical representation for edge comparison.
+        Undirected: (u, v) with u < v
+        Directed: unchanged
+        """
+        if self.make_undirected:
+            return torch.stack([
+                torch.minimum(edge_index[0], edge_index[1]),
+                torch.maximum(edge_index[0], edge_index[1]),
+            ], dim=0)
+        return edge_index
+
+    def get_edges_to_attack(self, n_perturbations, edges_to_attack_as_matrix_idx):
+        print()
+        edges_idx = edges_to_attack_as_matrix_idx
+        for _ in range(self.max_final_samples):
+
+            self.current_node_search_space, self.PRBCDSamplingModification = self.setup_current_node_search_space()
+
+            edges_idx = self.PRBCDSamplingModification.build_full_idx_matrix_method_dependent(
+                sample_size=n_perturbations,
+                method_for_target_nodes_1=self.method_for_target_nodes_1,
+                method_for_target_nodes_2=self.method_for_target_nodes_2,
+                target_edges_as_matrix_idx=edges_idx,
+                draw_only_nodes_1_from_method=self.draw_nodes_partly_from_method,
+                score=self.score,
+                degrees=self.degrees,
+                grid_binary_class=self.grid_binary_class,
+                current_node_search_space=self.current_node_search_space,
+                highest_ra=self.highest_ra
+            )
+
+            if self.make_undirected:
+                # make undirected: cut all (x,y) where x >= y
+                current_search_space = self.edges_as_matrix_idx_to_current_search_space(self.n, edges_idx)
+                modified_edge_index = CertificateAttack.linear_to_triu_idx(self.n, current_search_space)
+
+            else:
+                # TODO: i have not checked if it works for the directed case, I think it will NOT work
+                current_search_space = self.edges_as_matrix_idx_to_current_search_space(self.n, edges_idx)
+                modified_edge_index = CertificateAttack.cut_diagonal_entries(edges_idx)
+
+            self.perturbed_edge_weight = torch.full_like(
+                current_search_space, 1, dtype=torch.float32, requires_grad=True
+            )
+            if current_search_space.size(0) >= n_perturbations:
+                return current_search_space, modified_edge_index
+        raise RuntimeError('Sampling random block was not successfully. Please decrease `n_perturbations`.')
+
     def _get_logits(self, attr: torch.Tensor, edge_index: torch.Tensor, edge_weight: torch.Tensor):
-        a = attr.to(self.device)
-        b = edge_index.to(self.device), edge_weight.to(self.device)
+
         return self.attacked_model(
             data=attr.to(self.device),
             adj=(edge_index.to(self.device), edge_weight.to(self.device))
@@ -419,12 +567,13 @@ class PRBCD(SparseAttack):
     def sample_random_block(self, n_perturbations: int = 0):
         for _ in range(self.max_final_samples):
             self.current_search_space = torch.randint(
-                self.n_possible_edges, (self.block_size,), device=self.device)
+                # self.n_possible_edges, (self.block_size,), device=self.device)
+                self.n_possible_edges, (n_perturbations,), device=self.device)
             self.current_search_space = torch.unique(self.current_search_space, sorted=True)
             if self.make_undirected:
-                self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+                self.modified_edge_index = CertificateAttack.linear_to_triu_idx(self.n, self.current_search_space)
             else:
-                self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
+                self.modified_edge_index = CertificateAttack.linear_to_full_idx(self.n, self.current_search_space)
                 is_not_self_loop = self.modified_edge_index[0] != self.modified_edge_index[1]
                 self.current_search_space = self.current_search_space[is_not_self_loop]
                 self.modified_edge_index = self.modified_edge_index[:, is_not_self_loop]
@@ -469,11 +618,11 @@ class PRBCD(SparseAttack):
             if self.make_undirected:
                 # make undirected: cut all (x,y) where x >= y
                 self.current_search_space = self.edges_to_current_search_space(self.n)
-                self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+                self.modified_edge_index = CertificateAttack.linear_to_triu_idx(self.n, self.current_search_space)
 
             else:
                 # TODO: i have not checked if it works for the directed case, I think it will NOT work
-                self.modified_edge_index = PRBCD.cut_diagonal_entries(edges_idx)
+                self.modified_edge_index = CertificateAttack.cut_diagonal_entries(edges_idx)
 
             self.perturbed_edge_weight = torch.full_like(
                 self.current_search_space, self.eps, dtype=torch.float32, requires_grad=True
@@ -504,11 +653,11 @@ class PRBCD(SparseAttack):
             if self.make_undirected:
                 # make undirected: cut all (x,y) where x >= y
                 self.current_search_space = self.edges_as_matrix_idx_to_current_search_space(self.n, edges_idx)
-                self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+                self.modified_edge_index = CertificateAttack.linear_to_triu_idx(self.n, self.current_search_space)
 
             else:
                 # TODO: i have not checked if it works for the directed case, I think it will NOT work
-                self.modified_edge_index = PRBCD.cut_diagonal_entries(edges_idx)
+                self.modified_edge_index = CertificateAttack.cut_diagonal_entries(edges_idx)
 
             self.perturbed_edge_weight = torch.full_like(
                 self.current_search_space, self.eps, dtype=torch.float32, requires_grad=True
@@ -544,9 +693,9 @@ class PRBCD(SparseAttack):
             )
 
             if self.make_undirected:
-                self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+                self.modified_edge_index = CertificateAttack.linear_to_triu_idx(self.n, self.current_search_space)
             else:
-                self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
+                self.modified_edge_index = CertificateAttack.linear_to_full_idx(self.n, self.current_search_space)
 
             # Merge existing weights with new edge weights
             perturbed_edge_weight_old = self.perturbed_edge_weight.clone()
@@ -601,9 +750,9 @@ class PRBCD(SparseAttack):
             )
 
             if self.make_undirected:
-                self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+                self.modified_edge_index = CertificateAttack.linear_to_triu_idx(self.n, self.current_search_space)
             else:
-                self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
+                self.modified_edge_index = CertificateAttack.linear_to_full_idx(self.n, self.current_search_space)
 
             # Merge existing weights with new edge weights
             perturbed_edge_weight_old = self.perturbed_edge_weight.clone()
@@ -666,9 +815,9 @@ class PRBCD(SparseAttack):
             )
 
             if self.make_undirected:
-                self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+                self.modified_edge_index = CertificateAttack.linear_to_triu_idx(self.n, self.current_search_space)
             else:
-                self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
+                self.modified_edge_index = CertificateAttack.linear_to_full_idx(self.n, self.current_search_space)
 
             # Merge existing weights with new edge weights
             perturbed_edge_weight_old = self.perturbed_edge_weight.clone()
@@ -747,9 +896,9 @@ class PRBCD(SparseAttack):
             )
 
             if self.make_undirected:
-                self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+                self.modified_edge_index = CertificateAttack.linear_to_triu_idx(self.n, self.current_search_space)
             else:
-                self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
+                self.modified_edge_index = CertificateAttack.linear_to_full_idx(self.n, self.current_search_space)
 
             # Merge existing weights with new edge weights
             perturbed_edge_weight_old = self.perturbed_edge_weight.clone()
@@ -856,18 +1005,18 @@ class PRBCD(SparseAttack):
     def edges_to_current_search_space(self, n: int):
         # first we cut edges so that index build a triu matrix
         # (function triu_idx_to_linear only support triu matrix idx)
-        self.edges_to_attack_index = PRBCD.flip_matrix_idx_to_triu_idx(self.edges_to_attack_index)
+        self.edges_to_attack_index = CertificateAttack.flip_matrix_idx_to_triu_idx(self.edges_to_attack_index)
         # we then build linear idx which is the current_search_space
-        lin_idx = PRBCD.triu_idx_to_linear_idx(n, self.edges_to_attack_index)
+        lin_idx = CertificateAttack.triu_idx_to_linear_idx(n, self.edges_to_attack_index)
         lin_idx = torch.unique(lin_idx, sorted=True)
         return lin_idx
 
     def edges_as_matrix_idx_to_current_search_space(self, n: int, edges_as_matrix_idx):
         # first we cut edges so that index build a triu matrix
         # (function triu_idx_to_linear only support triu matrix idx)
-        edges_as_triu_matrix_idx = PRBCD.flip_matrix_idx_to_triu_idx(edges_as_matrix_idx)
+        edges_as_triu_matrix_idx = CertificateAttack.flip_matrix_idx_to_triu_idx(edges_as_matrix_idx)
         # we then build linear idx which is the current_search_space
-        lin_idx = PRBCD.triu_idx_to_linear_idx(n, edges_as_triu_matrix_idx)
+        lin_idx = CertificateAttack.triu_idx_to_linear_idx(n, edges_as_triu_matrix_idx)
         lin_idx = torch.unique(lin_idx, sorted=True)
         return lin_idx
 
@@ -901,7 +1050,7 @@ class PRBCD(SparseAttack):
 
     @staticmethod
     def flip_matrix_idx_to_triu_idx(matrix: torch.tensor) -> torch.tensor:
-        matrix = PRBCD.cut_diagonal_entries(matrix)
+        matrix = CertificateAttack.cut_diagonal_entries(matrix)
         row_idx = matrix[0]
         col_idx = matrix[1]
         # flip all entries of matrix where the entry (x,y) holds x>y

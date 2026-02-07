@@ -49,7 +49,7 @@ grid:
 prbcd:
   fixed:
     binary_attr: False
-    attack: PRBCD
+    attack: CertificateAttack
     attack_params:
       epochs: 11
       fine_tune_epochs: 1

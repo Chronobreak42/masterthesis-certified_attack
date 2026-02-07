@@ -1,4 +1,3 @@
-
 import logging
 from typing import Any, Dict, Sequence, Union, Optional
 
@@ -9,6 +8,7 @@ import torch
 
 from rgnn_at_scale.attacks import Attack, create_attack
 from experiments.common import prepare_attack_experiment, run_global_attack
+from rgnn_at_scale.attacks.modification_methods import Method
 
 try:
     import seml
@@ -40,7 +40,7 @@ def config():
     device = 0
     seed = 0
 
-    attack = 'PRBCD'
+    attack = 'CertificateAttack'
     attack_params = dict(
         epochs=500,
         fine_tune_epochs=100,
@@ -64,7 +64,14 @@ def config():
 def run(data_dir: str, dataset: str, attack: str, attack_params: Dict[str, Any], epsilons: Sequence[float],
         binary_attr: bool, make_undirected: bool, seed: int, artifact_dir: str, pert_adj_storage_type: str,
         pert_attr_storage_type: str, model_label: str, model_storage_type: str, device: Union[str, int],
-        data_device: Union[str, int], debug_level: str, semi: bool, use_cert: str = "none", grid_radii: Optional[np.ndarray] = None, grid_binary_class: Optional[np.ndarray] = None):
+        data_device: Union[str, int], debug_level: str,
+        method_to_use,
+        method_for_second_nodeset,
+        replace_sampling_method: bool,
+        replace_resampling_method: bool,
+        draw_nodes_partly_from_method: bool,
+        grid_radii: Optional[np.ndarray] = None,
+        grid_binary_class: Optional[np.ndarray] = None,):
     """
     Instantiates a sacred experiment executing a global direct attack run for a given model configuration.
     Caches the perturbed adjacency to storage and evaluates the models perturbed accuracy. 
@@ -73,6 +80,13 @@ def run(data_dir: str, dataset: str, attack: str, attack_params: Dict[str, Any],
 
     Parameters
     ----------
+    grid_binary_class
+    grid_radii
+    draw_nodes_partly_from_method
+    replace_resampling_method
+    replace_sampling_method
+    method_for_second_nodeset
+    method_to_use
     data_dir : str
         Path to data folder that contains the dataset
     dataset : str
@@ -88,7 +102,7 @@ def run(data_dir: str, dataset: str, attack: str, attack_params: Dict[str, Any],
         If true the attributes are binarized (!=0)
     attack : str
         The name of the attack class to use. Supported attacks are:
-            - PRBCD
+            - CertificateAttack
             - GreedyRBCD
             - DICE
             - FGSM
@@ -124,7 +138,7 @@ def run(data_dir: str, dataset: str, attack: str, attack_params: Dict[str, Any],
     (
         attr, adj, labels, _, _, idx_test, storage, attack_params, pert_params, model_params, m
     ) = prepare_attack_experiment(
-        data_dir, dataset, attack, attack_params, epsilons, binary_attr, make_undirected,  seed, artifact_dir,
+        data_dir, dataset, attack, attack_params, epsilons, binary_attr, make_undirected, seed, artifact_dir,
         pert_adj_storage_type, pert_attr_storage_type, model_label, model_storage_type, device, surrogate_model_label,
         data_device, debug_level, ex
     )
@@ -143,7 +157,15 @@ def run(data_dir: str, dataset: str, attack: str, attack_params: Dict[str, Any],
 
         for epsilon in epsilons:
             run_global_attack(epsilon, m, storage, pert_adj_storage_type, pert_attr_storage_type,
-                              pert_params, adversary, model_label, semi=semi, use_cert=use_cert, grid_radii=grid_radii, grid_binary_class=grid_binary_class)
+                              pert_params, adversary, model_label,
+                              method_to_use=method_to_use,
+                              method_for_second_nodeset=method_for_second_nodeset,
+                              replace_sampling_method=replace_sampling_method,
+                              replace_resampling_method=replace_resampling_method,
+                              draw_nodes_partly_from_method=draw_nodes_partly_from_method,
+                              grid_radii=grid_radii,
+                              grid_binary_class=grid_binary_class,
+                              seed=seed,)
 
             adj_adversary = adversary.adj_adversary
             attr_adversary = adversary.attr_adversary
@@ -154,7 +176,8 @@ def run(data_dir: str, dataset: str, attack: str, attack_params: Dict[str, Any],
             results.append({
                 'label': model_label,
                 'epsilon': epsilon,
-                'accuracy': accuracy
+                'accuracy': accuracy,
+                'adj_adversary':adj_adversary
             })
 
             if torch.cuda.is_available():

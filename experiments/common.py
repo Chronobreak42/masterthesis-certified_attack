@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from sacred import Experiment
 from torch_sparse import SparseTensor
 
+from rgnn_at_scale.attacks.modification_methods import Method
 from rgnn_at_scale.data import prep_graph, split
 from rgnn_at_scale.helper.io import Storage
 from rgnn_at_scale.models import BATCHED_PPR_MODELS
@@ -95,7 +96,15 @@ def prepare_attack_experiment(data_dir: str, dataset: str, attack: str, attack_p
 
 
 def run_global_attack(epsilon, m, storage, pert_adj_storage_type, pert_attr_storage_type,
-                      pert_params, adversary, model_label,semi, use_cert, grid_radii: Optional[np.ndarray] = None, grid_binary_class: Optional[np.ndarray] = None):
+                      pert_params, adversary, model_label,
+                      method_to_use,
+                      method_for_second_nodeset,
+                      replace_sampling_method,
+                      replace_resampling_method,
+                      draw_nodes_partly_from_method,
+                      grid_radii: Optional[np.ndarray] = None,
+                      grid_binary_class: Optional[np.ndarray] = None,
+                      seed: Optional[int] = 1,):
     n_perturbations = int(round(epsilon * m))
 
     pert_adj = storage.load_artifact(pert_adj_storage_type, {**pert_params, **{'epsilon': epsilon}})
@@ -107,7 +116,15 @@ def run_global_attack(epsilon, m, storage, pert_adj_storage_type, pert_attr_stor
         adversary.set_pertubations(pert_adj, pert_attr)
     else:
         logging.info(f"No cached perturbations found for model '{model_label}' and eps {epsilon}. Execute attack...")
-        adversary.attack(n_perturbations, semi = semi, use_cert = use_cert, grid_radii = grid_radii, grid_binary_class = grid_binary_class)
+        adversary.attack(n_perturbations,
+                         method_to_use=method_to_use,
+                         method_for_second_nodeset=method_for_second_nodeset,
+                         replace_sampling_method=replace_sampling_method,
+                         replace_resampling_method=replace_resampling_method,
+                         draw_nodes_partly_from_method=draw_nodes_partly_from_method,
+                         grid_radii=grid_radii,
+                         grid_binary_class=grid_binary_class,
+                         seed=seed)
         pert_adj, pert_attr = adversary.get_pertubations()
 
         if n_perturbations > 0:

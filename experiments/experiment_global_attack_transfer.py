@@ -82,7 +82,7 @@ def run(data_dir: str, dataset: str, attack: str, attack_params: Dict[str, Any],
         If true the attributes are binarized (!=0)
     attack : str
         The name of the attack class to use. Supported attacks are:
-            - PRBCD
+            - CertificateAttack
             - GreedyRBCD
             - DICE
             - FGSM

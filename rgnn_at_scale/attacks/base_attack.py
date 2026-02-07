@@ -13,6 +13,7 @@ from torch.nn import functional as F
 
 from torch_sparse import SparseTensor
 
+from rgnn_at_scale.attacks.modification_methods import Method
 from rgnn_at_scale.models import MODEL_TYPE, DenseGCN, GCN, RGNN, BATCHED_PPR_MODELS
 from rgnn_at_scale.helper.utils import accuracy
 
@@ -76,14 +77,14 @@ class Attack(ABC):
 
         if isinstance(model, GCN) or isinstance(model, RGNN):
             assert (
-                model.gdc_params is None
-                or 'use_cpu' not in model.gdc_params
-                or not model.gdc_params['use_cpu']
+                    model.gdc_params is None
+                    or 'use_cpu' not in model.gdc_params
+                    or not model.gdc_params['use_cpu']
             ), "GDC doesn't support a gradient w.r.t. the adjacency"
             assert model.svd_params is None, "SVD preproc. doesn't support a gradient w.r.t. the adjacency"
             assert model.jaccard_params is None, "Jaccard preproc. doesn't support a gradient w.r.t. the adjacency"
         if isinstance(model, RGNN):
-            assert model._mean in ['dimmedian', 'medoid', 'soft_median'],\
+            assert model._mean in ['dimmedian', 'medoid', 'soft_median'], \
                 "Agg. doesn't support a gradient w.r.t. the adjacency"
 
         self.device = device
@@ -112,18 +113,37 @@ class Attack(ABC):
     def _attack(self, n_perturbations: int, **kwargs):
         pass
 
-    def attack(self, n_perturbations: int, semi: bool, use_cert: str = "none", grid_radii: Optional[np.ndarray] = None, grid_binary_class: Optional[np.ndarray] = None, **kwargs):
+    def attack(self, n_perturbations: int,
+               method_to_use=Method.STANDARD,
+               method_for_second_nodeset=Method.METHOD_1,
+               replace_sampling_method=False,
+               replace_resampling_method=False,
+               draw_nodes_partly_from_method: bool = False,
+               grid_radii: Optional[np.ndarray] = None,
+               grid_binary_class: Optional[np.ndarray] = None,
+               seed: Optional[int] = 1,
+                **kwargs):
         """
         Executes the attack on the model updating the attributes
         self.adj_adversary and self.attr_adversary accordingly.
 
         Parameters
         ----------
+        method_for_second_nodeset
+        method_to_use
         n_perturbations : int
             number of perturbations (attack budget in terms of node additions/deletions) that constrain the atack
         """
         if n_perturbations > 0:
-            return self._attack(n_perturbations, **kwargs, semi=semi, use_cert=use_cert, grid_radii=grid_radii, grid_binary_class=grid_binary_class)
+            return self._attack(n_perturbations, **kwargs,
+                                method_to_use=method_to_use,
+                                method_for_second_nodeset=method_for_second_nodeset,
+                                replace_sampling_method=replace_sampling_method,
+                                replace_resampling_method=replace_resampling_method,
+                                draw_nodes_partly_from_method=draw_nodes_partly_from_method,
+                                grid_radii=grid_radii,
+                                grid_binary_class=grid_binary_class,
+                                seed=seed)
         else:
             self.attr_adversary = self.attr
             self.adj_adversary = self.adj
@@ -176,32 +196,32 @@ class Attack(ABC):
             sorted = logits.argsort(-1)
             best_non_target_class = sorted[sorted != labels[:, None]].reshape(logits.size(0), -1)[:, -1]
             margin = (
-                logits[np.arange(logits.size(0)), labels]
-                - logits[np.arange(logits.size(0)), best_non_target_class]
+                    logits[np.arange(logits.size(0)), labels]
+                    - logits[np.arange(logits.size(0)), best_non_target_class]
             )
             loss = -torch.clamp(margin, min=0).mean()
         elif self.loss_type == 'LCW':
             sorted = logits.argsort(-1)
             best_non_target_class = sorted[sorted != labels[:, None]].reshape(logits.size(0), -1)[:, -1]
             margin = (
-                logits[np.arange(logits.size(0)), labels]
-                - logits[np.arange(logits.size(0)), best_non_target_class]
+                    logits[np.arange(logits.size(0)), labels]
+                    - logits[np.arange(logits.size(0)), best_non_target_class]
             )
             loss = -F.leaky_relu(margin, negative_slope=0.1).mean()
         elif self.loss_type == 'tanhMargin':
             sorted = logits.argsort(-1)
             best_non_target_class = sorted[sorted != labels[:, None]].reshape(logits.size(0), -1)[:, -1]
             margin = (
-                logits[np.arange(logits.size(0)), labels]
-                - logits[np.arange(logits.size(0)), best_non_target_class]
+                    logits[np.arange(logits.size(0)), labels]
+                    - logits[np.arange(logits.size(0)), best_non_target_class]
             )
             loss = torch.tanh(-margin).mean()
         elif self.loss_type == 'Margin':
             sorted = logits.argsort(-1)
             best_non_target_class = sorted[sorted != labels[:, None]].reshape(logits.size(0), -1)[:, -1]
             margin = (
-                logits[np.arange(logits.size(0)), labels]
-                - logits[np.arange(logits.size(0)), best_non_target_class]
+                    logits[np.arange(logits.size(0)), labels]
+                    - logits[np.arange(logits.size(0)), best_non_target_class]
             )
             loss = -margin.mean()
         elif self.loss_type.startswith('tanhMarginCW-'):
@@ -211,8 +231,8 @@ class Attack(ABC):
             sorted = logits.argsort(-1)
             best_non_target_class = sorted[sorted != labels[:, None]].reshape(logits.size(0), -1)[:, -1]
             margin = (
-                logits[np.arange(logits.size(0)), labels]
-                - logits[np.arange(logits.size(0)), best_non_target_class]
+                    logits[np.arange(logits.size(0)), labels]
+                    - logits[np.arange(logits.size(0)), best_non_target_class]
             )
             loss = (alpha * torch.tanh(-margin) - (1 - alpha) * torch.clamp(margin, min=0)).mean()
         elif self.loss_type.startswith('tanhMarginMCE-'):
@@ -223,20 +243,20 @@ class Attack(ABC):
             sorted = logits.argsort(-1)
             best_non_target_class = sorted[sorted != labels[:, None]].reshape(logits.size(0), -1)[:, -1]
             margin = (
-                logits[np.arange(logits.size(0)), labels]
-                - logits[np.arange(logits.size(0)), best_non_target_class]
+                    logits[np.arange(logits.size(0)), labels]
+                    - logits[np.arange(logits.size(0)), best_non_target_class]
             )
 
             not_flipped = logits.argmax(-1) == labels
 
             loss = alpha * torch.tanh(-margin).mean() + (1 - alpha) * \
-                F.cross_entropy(logits[not_flipped], labels[not_flipped])
+                   F.cross_entropy(logits[not_flipped], labels[not_flipped])
         elif self.loss_type == 'eluMargin':
             sorted = logits.argsort(-1)
             best_non_target_class = sorted[sorted != labels[:, None]].reshape(logits.size(0), -1)[:, -1]
             margin = (
-                logits[np.arange(logits.size(0)), labels]
-                - logits[np.arange(logits.size(0)), best_non_target_class]
+                    logits[np.arange(logits.size(0)), labels]
+                    - logits[np.arange(logits.size(0)), best_non_target_class]
             )
             loss = -F.elu(margin).mean()
         elif self.loss_type == 'MCE':
@@ -332,22 +352,22 @@ class SparseLocalAttack(SparseAttack):
                    model: MODEL_TYPE,
                    node_idx: int,
                    perturbed_graph: Optional[Union[SparseTensor,
-                                                   Tuple[TensorType[2, "nnz"],
-                                                         TensorType["nnz"]]]] = None):
+                   Tuple[TensorType[2, "nnz"],
+                   TensorType["nnz"]]]] = None):
         pass
 
     def get_surrogate_logits(self,
                              node_idx: int,
                              perturbed_graph: Optional[Union[SparseTensor,
-                                                             Tuple[TensorType[2, "nnz"],
-                                                                   TensorType["nnz"]]]] = None) -> torch.Tensor:
+                             Tuple[TensorType[2, "nnz"],
+                             TensorType["nnz"]]]] = None) -> torch.Tensor:
         return self.get_logits(self.attacked_model, node_idx, perturbed_graph)
 
     def get_eval_logits(self,
                         node_idx: int,
                         perturbed_graph: Optional[Union[SparseTensor,
-                                                        Tuple[TensorType[2, "nnz"],
-                                                              TensorType["nnz"]]]] = None) -> torch.Tensor:
+                        Tuple[TensorType[2, "nnz"],
+                        TensorType["nnz"]]]] = None) -> torch.Tensor:
         return self.get_logits(self.eval_model, node_idx, perturbed_graph)
 
     @torch.no_grad()

@@ -80,7 +80,7 @@ greedy_rbcd:
 
 prbcd:
   fixed:
-    attack: PRBCD
+    attack: CertificateAttack
     surrogate_model_label: Vanilla GCN
   grid:
     attack_params: 
